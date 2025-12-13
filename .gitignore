@@ -1,0 +1,17 @@
+# --- Output / Data Files ---
+# Prevent committing the exported data
+*.json
+*.csv
+
+# --- VS Code / IDE ---
+# Ignore local workspace settings and debug configurations
+.vscode/
+
+# --- PowerShell ---
+# transcripts or logs if you ever enable them
+*.log
+*.transcript
+
+# --- OS System Files ---
+.DS_Store
+Thumbs.db
