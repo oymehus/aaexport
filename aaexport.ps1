@@ -98,15 +98,24 @@ function Get-FlowMetricsRow {
 
     foreach ($col in $BoardColumns) { $rowMap[$col] = $null }
 
-    # 3. History Replay
+    # 3. History Replay (With Backflow Detection)
     $updates = Invoke-AdoRest -Url "$BaseUrl/_apis/wit/workitems/$($Id)/updates?api-version=$ApiVersion" -Headers $Headers
-    $currentColName = $null; $currentIsDone = $false; $totalBlockedDays = 0; $blockedStartDate = $null; $isCurrentlyBlocked = $false
+    
+    $currentColName = $null
+    $currentIsDone = $false
+    $totalBlockedDays = 0
+    $blockedStartDate = $null
+    $isCurrentlyBlocked = $false
+    
+    # Track the furthest column reached to detect backflow
+    $maxColIndexReached = -1
 
     $updates.value | Sort-Object -Property "rev" | ForEach-Object {
         $update = $_
         $changeDateVal = $update.fields."System.ChangedDate".newValue
         $currentDate = if ($changeDateVal) { [DateTime]$changeDateVal } else { $null }
 
+        # Blocked Logic
         if ($update.fields -and $update.fields."Microsoft.VSTS.CMMI.Blocked") {
             $blockedStatus = $update.fields."Microsoft.VSTS.CMMI.Blocked".newValue
             if ($blockedStatus -eq "Yes") { $blockedStartDate = $currentDate; $isCurrentlyBlocked = $true } 
@@ -118,6 +127,8 @@ function Get-FlowMetricsRow {
                 $isCurrentlyBlocked = $false; $blockedStartDate = $null
             }
         }
+
+        # Column Logic
         $hasColChange = $false
         if ($update.fields -and $update.fields."System.BoardColumn") { $currentColName = $update.fields."System.BoardColumn".newValue; $currentIsDone = $false; $hasColChange = $true }
         if ($update.fields -and $update.fields."System.BoardColumnDone") { $currentIsDone = [bool]$update.fields."System.BoardColumnDone".newValue; $hasColChange = $true }
@@ -125,8 +136,33 @@ function Get-FlowMetricsRow {
         if ($hasColChange -and $currentColName) {
             $targetHeader = $currentColName
             if ($currentIsDone -and $SplitMap[$currentColName]) { $targetHeader = "$currentColName Done" }
-            if ($BoardColumns -contains $targetHeader -and -not $rowMap[$targetHeader]) {
-                if ($currentDate) { $rowMap[$targetHeader] = $currentDate.ToString("yyyy-MM-dd") } 
+            
+            # Determine Index of this target header
+            $targetIndex = $BoardColumns.IndexOf($targetHeader)
+
+            if ($targetIndex -ge 0) {
+                # 1. Capture the date for this column
+                if (-not $rowMap[$targetHeader]) {
+                    if ($currentDate) { $rowMap[$targetHeader] = $currentDate.ToString("yyyy-MM-dd") } 
+                }
+
+                # 2. Backflow Check
+                # If we moved to an index LESS than what we've seen before, we went backwards.
+                # Example: Was in D (Index 3), moved to B (Index 1).
+                if ($targetIndex -lt $maxColIndexReached) {
+                    # Erase history for all columns to the RIGHT of current target
+                    # i.e., Clear C and D
+                    for ($i = $targetIndex + 1; $i -le $maxColIndexReached; $i++) {
+                        $colToClear = $BoardColumns[$i]
+                        $rowMap[$colToClear] = $null
+                    }
+                    # Reset max reach to current
+                    $maxColIndexReached = $targetIndex
+                } 
+                else {
+                    # Forward movement, update max reach
+                    $maxColIndexReached = $targetIndex
+                }
             }
         }
     }
@@ -138,23 +174,68 @@ function Get-FlowMetricsRow {
     }
     $rowMap["Blocked Days"] = $totalBlockedDays
 
-    $createdDateVal = $wiDetail.fields."System.CreatedDate"
-    if ($createdDateVal) {
-        $createdDate = [DateTime]$createdDateVal
-        $firstCol = $BoardColumns[0]
-        if (-not $rowMap[$firstCol]) { $rowMap[$firstCol] = $createdDate.ToString("yyyy-MM-dd") }
-    }
 
+    # 4. Date Fix: Forward Fill (Stop at last data point)
     if ($FixDecreasingDates) {
-        $maxDate = [DateTime]::MinValue
-        foreach ($col in $BoardColumns) {
-            $dateStr = $rowMap[$col]
-            if (-not [string]::IsNullOrWhiteSpace($dateStr)) {
-                $colDate = [DateTime]$dateStr
-                if ($colDate -lt $maxDate) { $rowMap[$col] = "" } else { $maxDate = $colDate }
+        
+        # A. Identify the Rightmost Column that actually has a date
+        # (This handles the "F is left empty" requirement)
+        $lastDataIndex = -1
+        for ($i = $BoardColumns.Count - 1; $i -ge 0; $i--) {
+            if (-not [string]::IsNullOrWhiteSpace($rowMap[$BoardColumns[$i]])) {
+                $lastDataIndex = $i
+                break
             }
         }
+
+        # B. Forward Fill / Monotony Enforcement
+        # Only run up to lastDataIndex. Columns to the right remain empty.
+        $runningMaxDate = [DateTime]::MinValue
+        
+        # Initialize runningMax with CreatedDate
+        if ($wiDetail.fields."System.CreatedDate") {
+            $runningMaxDate = [DateTime]$wiDetail.fields."System.CreatedDate"
+            # Ensure First Column has baseline if needed
+            if (-not $rowMap[$BoardColumns[0]]) {
+                 $rowMap[$BoardColumns[0]] = $runningMaxDate.ToString("yyyy-MM-dd")
+            }
+        }
+
+        # Loop 0 -> Last Data Index
+        if ($lastDataIndex -ge 0) {
+            for ($i = 0; $i -le $lastDataIndex; $i++) {
+                $colName = $BoardColumns[$i]
+                $thisDateStr = $rowMap[$colName]
+
+                if ([string]::IsNullOrWhiteSpace($thisDateStr)) {
+                    # Gap? Fill with running max (e.g. C gets B's date)
+                    if ($runningMaxDate -gt [DateTime]::MinValue) {
+                        $rowMap[$colName] = $runningMaxDate.ToString("yyyy-MM-dd")
+                    }
+                }
+                else {
+                    $thisDate = [DateTime]$thisDateStr
+                    if ($thisDate -lt $runningMaxDate) {
+                        # Decrease? Fix it (Backflow correction)
+                        $rowMap[$colName] = $runningMaxDate.ToString("yyyy-MM-dd")
+                    } else {
+                        # Increase? Update running max
+                        $runningMaxDate = $thisDate
+                    }
+                }
+            }
+        }
+    } 
+    else {
+        # Fallback (Standard)
+        $createdDateVal = $wiDetail.fields."System.CreatedDate"
+        if ($createdDateVal) {
+            $createdDate = [DateTime]$createdDateVal
+            $firstCol = $BoardColumns[0]
+            if (-not $rowMap[$firstCol]) { $rowMap[$firstCol] = $createdDate.ToString("yyyy-MM-dd") }
+        }
     }
+
     return $rowMap
 }
 
@@ -217,7 +298,6 @@ $results = @()
 if ($psVersion -ge 7) {
     Write-Host "Found $($workItems.Count) work items. Processing in Parallel (PS v$psVersion, $ThrottleLimit threads)..." -ForegroundColor Yellow
     
-    # Capture functions for thread hydration
     $funcInvokeRest = ${function:Invoke-AdoRest}.ToString()
     $funcGetRow = ${function:Get-FlowMetricsRow}.ToString()
 
@@ -246,7 +326,6 @@ else {
     
     foreach ($item in $workItems) {
         $current++
-        # Direct call (Sequential)
         $row = Get-FlowMetricsRow `
             -Id $item.id `
             -BaseUrl $baseUrl `
