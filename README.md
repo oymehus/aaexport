@@ -5,6 +5,7 @@
 This tool bridges the gap for users with a standalone SaaS license for ActionableAgile who cannot use the integrated Azure DevOps extension. It generates a JSON matrix file compliant with the ActionableAgile import schema, handling complex history replay, split columns, and hierarchy mapping automatically.
 
 ## Features
+* **Incremental Updates:** Drastically reduces runtime by comparing the live `Changed Date` against your local file, fetching history only for modified items.
 * **Split Column Support:** Automatically detects "Doing/Done" split columns and exports them as separate stages (e.g., `Develop` and `Develop Done`).
 * **Blocked Days:** Calculates the total days an item was flagged as "Blocked", excluding same-day blocks (e.g., Blocked 9am -> Unblocked 3pm = 0 days).
 * **Tag Formatting:** Automatically converts Azure DevOps tags to the `[Tag1|Tag2]` format required by ActionableAgile.
@@ -13,13 +14,12 @@ This tool bridges the gap for users with a standalone SaaS license for Actionabl
 * **Data Sanitization:** Optional `-FixDecreasingDates` switch to auto-correct "backward movement" timestamps that break flow analytics.
 
 ## Output
-The exported file is in `` json `` format, as this provides more consistency than with regards to dates than `` csv `` files.
+The exported file is in `` json `` format, as this provides more consistency with regards to dates than `` csv `` files.
 
 The export contains the following fields by default, and additional fields may be added using the `` -AdditionalFields `` parameter described below.
 
-
-| ID | Link | Title | ... Board columns ... | Blcoked Days | Blocked | Work Item Type | Tags | State | Area Path |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| ID | Link | Title | Work Item Type | Tags | Changed Date | ... Board columns ... | Blocked Days | Blocked | State | Area Path |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 ...
 
 #### Example
@@ -55,6 +55,7 @@ The script is controlled entirely via command-line arguments.
 | Parameter | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
 | `-Output` | Path | Yes | The destination path for the JSON file (e.g., `./export.json`). |
+| `-IncrementalUpdate`| Switch | No | Enables smart delta updates. Reads the existing output file and only fetches history for items that have a newer `Changed Date` on the server. |
 | `-HistoryLimit` | Int | No | Max number of most recent items to fetch. Default is `1000`. |
 | `-FixDecreasingDates`| Switch | No | If set, clears timestamps that appear chronologically *earlier* than a previous column (fixes "backward movement" data errors). |
 | `-ThrottleLimit` | Int | No | (PS 7+ only) Number of concurrent threads. Default is `8`. |
@@ -84,42 +85,6 @@ You can run the script directly from a PowerShell terminal. Use backticks `` ` `
   -AreaPaths "myproject\myarea" `
   -AdditionalFields "Parent=System.Parent", "Value Area=Microsoft.VSTS.Common.ValueArea", "AreaHierarchy", "NodeName" `
   -FixDecreasingDates `
+  -IncrementalUpdate `
   -Output ".\export.json" `
   -Pat "YOUR_PERSONAL_ACCESS_TOKEN"
-```
-
-### 2. Running via VS Code (launch.json)
-If you prefer debugging inside VS Code, add this configuration to your `` .vscode/launch.json ``. 
-Note: Arguments containing spaces must be wrapped in escaped quotes \".
-```json
-{
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "Run AAExport",
-            "type": "PowerShell",
-            "request": "launch",
-            "script": "${workspaceFolder}/AAExport.ps1",
-            "args": [
-                "-Org", "mycompany",
-                "-Project", "myproject",
-                "-Team", "\"myteam\"",
-                "-Board", "\"Features Board\"",
-                "-WorkItemTypes", "Feature",
-                "-AreaPaths", "\"myproject\\myarea\"",
-                
-                // Custom Field Configuration
-                "-AdditionalFields", 
-                    "Parent=System.Parent", 
-                    "\"Value Area=Microsoft.VSTS.Common.ValueArea\"", 
-                    "AreaHierarchy", 
-                    "NodeName",
-        
-                "-FixDecreasingDates",
-                "-Output", "${workspaceFolder}/export.json",
-                "-Pat", "${env:ADO_PAT}"
-            ]
-        }
-    ]
-}
-```

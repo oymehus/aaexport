@@ -9,6 +9,7 @@ param(
     [string[]]$AreaPaths,
     [string[]]$AdditionalFields,
     [switch]$FixDecreasingDates,
+    [switch]$IncrementalUpdate,
     [int]$HistoryLimit = 1000,
     [int]$ThrottleLimit = 8
 )
@@ -37,6 +38,54 @@ function Invoke-AdoRest {
             Start-Sleep -Seconds $wait
             $retryCount++
         }
+    }
+}
+
+function Get-ExistingCache {
+    param($Path, $TargetHeaders)
+    
+    if (-not (Test-Path $Path)) { return $null }
+
+    try {
+        Write-Host "Reading existing file for incremental comparison..." -ForegroundColor Cyan
+        $jsonContent = Get-Content -Path $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($jsonContent.Count -lt 2) { return $null } 
+
+        # 1. Schema Check
+        $fileHeaders = $jsonContent[0]
+        $h1 = $fileHeaders -join "|"
+        $h2 = $TargetHeaders -join "|"
+        
+        if ($h1 -ne $h2) { 
+            Write-Warning "Schema mismatch detected (Columns changed). Forcing full reload."
+            return $null
+        }
+
+        # 2. Index Mapping
+        $idIndex = $fileHeaders.IndexOf("ID")
+        $changeIndex = $fileHeaders.IndexOf("Changed Date")
+
+        if ($idIndex -eq -1 -or $changeIndex -eq -1) {
+            Write-Warning "Existing file missing ID or Changed Date. Forcing full reload."
+            return $null
+        }
+
+        # 3. Build Hashtable
+        $cache = @{}
+        for ($i = 1; $i -lt $jsonContent.Count; $i++) {
+            $row = $jsonContent[$i]
+            $id = $row[$idIndex]
+            
+            $cache[$id] = @{
+                Data = $row
+                ChangedDate = $row[$changeIndex] 
+            }
+        }
+        return $cache
+    }
+    catch {
+        Write-Warning "Could not parse existing file. Starting fresh. Error: $($_.Exception.Message)"
+        return $null
     }
 }
 
@@ -69,6 +118,7 @@ function Get-FlowMetricsRow {
         "Title" = $wiDetail.fields."System.Title"
         "Work Item Type" = $wiDetail.fields."System.WorkItemType"
         "Tags" = $formattedTags
+        "Changed Date" = $wiDetail.fields."System.ChangedDate" 
     }
 
     # 2. Dynamic Field Injection
@@ -106,8 +156,6 @@ function Get-FlowMetricsRow {
     $totalBlockedDays = 0
     $blockedStartDate = $null
     $isCurrentlyBlocked = $false
-    
-    # Track the furthest column reached to detect backflow
     $maxColIndexReached = -1
 
     $updates.value | Sort-Object -Property "rev" | ForEach-Object {
@@ -137,30 +185,22 @@ function Get-FlowMetricsRow {
             $targetHeader = $currentColName
             if ($currentIsDone -and $SplitMap[$currentColName]) { $targetHeader = "$currentColName Done" }
             
-            # Determine Index of this target header
             $targetIndex = $BoardColumns.IndexOf($targetHeader)
 
             if ($targetIndex -ge 0) {
-                # 1. Capture the date for this column
+                # 1. Capture date
                 if (-not $rowMap[$targetHeader]) {
                     if ($currentDate) { $rowMap[$targetHeader] = $currentDate.ToString("yyyy-MM-dd") } 
                 }
-
                 # 2. Backflow Check
-                # If we moved to an index LESS than what we've seen before, we went backwards.
-                # Example: Was in D (Index 3), moved to B (Index 1).
                 if ($targetIndex -lt $maxColIndexReached) {
-                    # Erase history for all columns to the RIGHT of current target
-                    # i.e., Clear C and D
                     for ($i = $targetIndex + 1; $i -le $maxColIndexReached; $i++) {
                         $colToClear = $BoardColumns[$i]
                         $rowMap[$colToClear] = $null
                     }
-                    # Reset max reach to current
                     $maxColIndexReached = $targetIndex
                 } 
                 else {
-                    # Forward movement, update max reach
                     $maxColIndexReached = $targetIndex
                 }
             }
@@ -179,7 +219,6 @@ function Get-FlowMetricsRow {
     if ($FixDecreasingDates) {
         
         # A. Identify the Rightmost Column that actually has a date
-        # (This handles the "F is left empty" requirement)
         $lastDataIndex = -1
         for ($i = $BoardColumns.Count - 1; $i -ge 0; $i--) {
             if (-not [string]::IsNullOrWhiteSpace($rowMap[$BoardColumns[$i]])) {
@@ -189,26 +228,22 @@ function Get-FlowMetricsRow {
         }
 
         # B. Forward Fill / Monotony Enforcement
-        # Only run up to lastDataIndex. Columns to the right remain empty.
         $runningMaxDate = [DateTime]::MinValue
         
         # Initialize runningMax with CreatedDate
         if ($wiDetail.fields."System.CreatedDate") {
             $runningMaxDate = [DateTime]$wiDetail.fields."System.CreatedDate"
-            # Ensure First Column has baseline if needed
             if (-not $rowMap[$BoardColumns[0]]) {
                  $rowMap[$BoardColumns[0]] = $runningMaxDate.ToString("yyyy-MM-dd")
             }
         }
 
-        # Loop 0 -> Last Data Index
         if ($lastDataIndex -ge 0) {
             for ($i = 0; $i -le $lastDataIndex; $i++) {
                 $colName = $BoardColumns[$i]
                 $thisDateStr = $rowMap[$colName]
 
                 if ([string]::IsNullOrWhiteSpace($thisDateStr)) {
-                    # Gap? Fill with running max (e.g. C gets B's date)
                     if ($runningMaxDate -gt [DateTime]::MinValue) {
                         $rowMap[$colName] = $runningMaxDate.ToString("yyyy-MM-dd")
                     }
@@ -216,10 +251,8 @@ function Get-FlowMetricsRow {
                 else {
                     $thisDate = [DateTime]$thisDateStr
                     if ($thisDate -lt $runningMaxDate) {
-                        # Decrease? Fix it (Backflow correction)
                         $rowMap[$colName] = $runningMaxDate.ToString("yyyy-MM-dd")
                     } else {
-                        # Increase? Update running max
                         $runningMaxDate = $thisDate
                     }
                 }
@@ -227,7 +260,7 @@ function Get-FlowMetricsRow {
         }
     } 
     else {
-        # Fallback (Standard)
+        # Fallback
         $createdDateVal = $wiDetail.fields."System.CreatedDate"
         if ($createdDateVal) {
             $createdDate = [DateTime]$createdDateVal
@@ -265,8 +298,19 @@ foreach ($fieldDef in $AdditionalFields) {
     else { $extraHeaders += $fieldDef; $fieldRefMap[$fieldDef] = $fieldDef }
 }
 
-# --- 3. Fetch Work Items ---
-Write-Host "Fetching work items..."
+$finalHeaders = @("ID", "Link", "Title", "Work Item Type", "Tags", "Changed Date") + $extraHeaders + @("State", "Area Path") + $boardColumns + @("Blocked", "Blocked Days")
+
+# --- 3. Incremental Cache Load ---
+$cache = $null
+if ($IncrementalUpdate) {
+    $cache = Get-ExistingCache -Path $Output -TargetHeaders $finalHeaders
+    if ($cache) {
+        Write-Host "Cache loaded: $($cache.Count) items found." -ForegroundColor Cyan
+    }
+}
+
+# --- 4. Fetch Work Items (Lightweight) ---
+Write-Host "Fetching work item list..."
 $typeWhere = ""
 $cleanTypes = $WorkItemTypes | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 if ($cleanTypes.Count -gt 0) { $formattedList = ($cleanTypes | ForEach-Object { "'$_'" }) -join ","; $typeWhere = "AND [System.WorkItemType] IN ($formattedList)" } 
@@ -286,80 +330,162 @@ else {
 }
 if ($targetAreas.Count -gt 0) { $areaClauses = $targetAreas | ForEach-Object { "[System.AreaPath] UNDER '$_'" }; $areaWhere = "AND ( " + ($areaClauses -join " OR ") + " )" }
 
-$wiql = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$Project' $typeWhere $areaWhere ORDER BY [System.ChangedDate] DESC"
+# Fetch ID AND ChangedDate for comparison
+$wiql = "SELECT [System.Id], [System.ChangedDate] FROM WorkItems WHERE [System.TeamProject] = '$Project' $typeWhere $areaWhere ORDER BY [System.ChangedDate] DESC"
 $queryResponse = Invoke-RestMethod -Uri "$baseUrl/_apis/wit/wiql?api-version=$apiVersion" -Method Post -Headers $headers -Body (@{ query = $wiql } | ConvertTo-Json) -ContentType "application/json"
-$workItems = $queryResponse.workItems | Select-Object -First $HistoryLimit
+$rawWorkItems = $queryResponse.workItems | Select-Object -First $HistoryLimit
 
+# --- 5. Determine Delta ---
+$itemsToProcess = [System.Collections.Generic.List[Object]]::new()
+$cachedRowsToKeep = [System.Collections.Generic.List[Object]]::new()
 
-# --- 4. Process Loop (Conditional Parallelism) ---
-$psVersion = $PSVersionTable.PSVersion.Major
-$results = @()
-
-if ($psVersion -ge 7) {
-    Write-Host "Found $($workItems.Count) work items. Processing in Parallel (PS v$psVersion, $ThrottleLimit threads)..." -ForegroundColor Yellow
+if ($cache) {
+    Write-Host "Calculating delta..." -ForegroundColor Cyan
+    $newCount = 0
+    $changeCount = 0
+    $skipCount = 0
     
-    $funcInvokeRest = ${function:Invoke-AdoRest}.ToString()
-    $funcGetRow = ${function:Get-FlowMetricsRow}.ToString()
-
-    $results = $workItems | ForEach-Object -Parallel {
-        ${function:Invoke-AdoRest} = $using:funcInvokeRest
-        ${function:Get-FlowMetricsRow} = $using:funcGetRow
+    # Batch Fetch Dates to do the comparison
+    $allIds = $rawWorkItems.id
+    $start = 0
+    while ($allIds -and $start -lt $allIds.Count) {
+        $count = [Math]::Min(200, $allIds.Count - $start)
+        $batchIds = $allIds[$start..($start + $count - 1)]
+        $start += $count
         
-        $row = Get-FlowMetricsRow `
-            -Id $_.id `
-            -BaseUrl $using:baseUrl `
-            -ApiVersion $using:apiVersion `
-            -BoardColumns $using:boardColumns `
-            -SplitMap $using:splitMap `
-            -FieldRefMap $using:fieldRefMap `
-            -CalcFlags $using:calcFlags `
-            -FixDecreasingDates $using:FixDecreasingDates `
-            -Headers $using:headers
+        $batchUrl = "$baseUrl/_apis/wit/workitems?ids=$($batchIds -join ',')&fields=System.Id,System.ChangedDate&api-version=$apiVersion"
+        $batchResponse = Invoke-AdoRest -Url $batchUrl -Headers $headers
+        
+        foreach ($wi in $batchResponse.value) {
+            $id = [string]$wi.id
+            $serverDateStr = $wi.fields."System.ChangedDate"
+            
+            if ($cache.ContainsKey($id)) {
+                $cachedDateStr = $cache[$id].ChangedDate
+                
+                $isMatch = $false
+                if ($serverDateStr -and $cachedDateStr) {
+                    try {
+                        $dtServer = [DateTime]$serverDateStr
+                        $dtCache  = [DateTime]$cachedDateStr
+                        if ($dtServer -eq $dtCache) { $isMatch = $true }
+                    } catch {
+                        if ($serverDateStr -eq $cachedDateStr) { $isMatch = $true }
+                    }
+                }
 
-        return [PSCustomObject]$row
-    } -ThrottleLimit $ThrottleLimit
-} 
-else {
-    Write-Host "Found $($workItems.Count) work items. Processing sequentially (PS v$psVersion)..." -ForegroundColor Yellow
-    $current = 0
-    $total = $workItems.Count
-    
-    foreach ($item in $workItems) {
-        $current++
-        $row = Get-FlowMetricsRow `
-            -Id $item.id `
-            -BaseUrl $baseUrl `
-            -ApiVersion $apiVersion `
-            -BoardColumns $boardColumns `
-            -SplitMap $splitMap `
-            -FieldRefMap $fieldRefMap `
-            -CalcFlags $calcFlags `
-            -FixDecreasingDates $FixDecreasingDates `
-            -Headers $headers
+                if ($isMatch) {
+                    $cachedRowsToKeep.Add($cache[$id].Data)
+                    $skipCount++
+                } else {
+                    $itemsToProcess.Add($wi)
+                    $changeCount++
+                }
+            } else {
+                $itemsToProcess.Add($wi)
+                $newCount++
+            }
+        }
+    }
+    Write-Host "Delta: $newCount New, $changeCount Changed, $skipCount Skipped." -ForegroundColor Yellow
+} else {
+    foreach($item in $rawWorkItems) { $itemsToProcess.Add($item) }
+}
 
-        $results += [PSCustomObject]$row
-        Write-Progress -Activity "Processing Work Items" -Status "ID: $($item.id)" -PercentComplete (($current / $total) * 100)
+# --- 6. Process Loop (Parallel/Sequential) ---
+$psVersion = $PSVersionTable.PSVersion.Major
+$processedResults = [System.Collections.Generic.List[Object]]::new()
+
+if ($itemsToProcess.Count -gt 0) {
+    if ($psVersion -ge 7) {
+        Write-Host "Processing $($itemsToProcess.Count) items in Parallel..." -ForegroundColor Yellow
+        $funcInvokeRest = ${function:Invoke-AdoRest}.ToString()
+        $funcGetRow = ${function:Get-FlowMetricsRow}.ToString()
+        
+        $itemsArray = $itemsToProcess.ToArray()
+
+        $pResults = $itemsArray | ForEach-Object -Parallel {
+            ${function:Invoke-AdoRest} = $using:funcInvokeRest
+            ${function:Get-FlowMetricsRow} = $using:funcGetRow
+            
+            $row = Get-FlowMetricsRow `
+                -Id $_.id `
+                -BaseUrl $using:baseUrl `
+                -ApiVersion $using:apiVersion `
+                -BoardColumns $using:boardColumns `
+                -SplitMap $using:splitMap `
+                -FieldRefMap $using:fieldRefMap `
+                -CalcFlags $using:calcFlags `
+                -FixDecreasingDates $using:FixDecreasingDates `
+                -Headers $using:headers
+            
+            # Console Feedback
+            # if ($_.id % 10 -eq 0) { Write-Host "." -NoNewline }
+            return [PSCustomObject]$row
+        } -ThrottleLimit $ThrottleLimit
+
+        foreach($r in $pResults) { $processedResults.Add($r) }
+        Write-Host ""
+    } 
+    else {
+        Write-Host "Processing $($itemsToProcess.Count) items Sequentially..." -ForegroundColor Yellow
+        $current = 0
+        $total = $itemsToProcess.Count
+        
+        foreach ($item in $itemsToProcess) {
+            $current++
+            $row = Get-FlowMetricsRow `
+                -Id $item.id `
+                -BaseUrl $baseUrl `
+                -ApiVersion $apiVersion `
+                -BoardColumns $boardColumns `
+                -SplitMap $splitMap `
+                -FieldRefMap $fieldRefMap `
+                -CalcFlags $calcFlags `
+                -FixDecreasingDates $FixDecreasingDates `
+                -Headers $headers
+
+            $processedResults.Add([PSCustomObject]$row)
+            Write-Progress -Activity "Processing Work Items" -Status "ID: $($item.id) ($current/$total)" -PercentComplete (($current / $total) * 100)
+        }
     }
 }
 
+# --- 7. Merge and Export ---
+Write-Host "Merging & Exporting..." -ForegroundColor Cyan
 
-# --- 5. Export JSON ---
-Write-Host "Constructing JSON Matrix..." -ForegroundColor Cyan
-$finalHeaders = @("ID", "Link", "Title", "Work Item Type", "Tags") + $extraHeaders + @("State", "Area Path") + $boardColumns + @("Blocked", "Blocked Days")
-$jsonRows = @()
-function Format-JsonStr { param($s) return '"' + $s.ToString().Replace('\', '\\').Replace('"', '\"') + '"' }
+$jsonRows = [System.Collections.Generic.List[String]]::new()
 
+function Format-JsonStr { 
+    param($s) 
+    if ($s -is [DateTime]) {
+        return '"' + $s.ToString("yyyy-MM-ddTHH:mm:ss.fffZ") + '"'
+    }
+    return '"' + $s.ToString().Replace('\', '\\').Replace('"', '\"') + '"' 
+}
+
+# Header
 $headerStr = "[" + (($finalHeaders | ForEach-Object { Format-JsonStr $_ }) -join ",") + "]"
-$jsonRows += $headerStr
+$jsonRows.Add($headerStr)
 
-foreach ($item in $results) {
+# Add Cached Rows
+foreach ($rowArr in $cachedRowsToKeep) {
+    $quoted = @()
+    foreach($cell in $rowArr) {
+        $quoted += Format-JsonStr $cell
+    }
+    $jsonRows.Add("[" + ($quoted -join ",") + "]")
+}
+
+# Add New Rows
+foreach ($item in $processedResults) {
     $rowValues = @()
     foreach ($h in $finalHeaders) {
         $val = $item.$h
         if ($null -eq $val) { $val = "" }
         $rowValues += Format-JsonStr $val
     }
-    $jsonRows += "[" + ($rowValues -join ",") + "]"
+    $jsonRows.Add("[" + ($rowValues -join ",") + "]")
 }
 
 $finalJson = "[" + [Environment]::NewLine + ($jsonRows -join "," + [Environment]::NewLine) + [Environment]::NewLine + "]"
