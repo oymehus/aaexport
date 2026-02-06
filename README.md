@@ -88,3 +88,42 @@ You can run the script directly from a PowerShell terminal. Use backticks `` ` `
   -IncrementalUpdate `
   -Output ".\export.json" `
   -Pat "YOUR_PERSONAL_ACCESS_TOKEN"
+```
+
+### 2. Running via VS Code (launch.json)
+If you prefer debugging inside VS Code, add this configuration to your `` .vscode/launch.json ``.
+
+Note: Arguments containing spaces must be wrapped in escaped quotes `` \" ``.
+
+```json 
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run AAExport",
+            "type": "PowerShell",
+            "request": "launch",
+            "script": "${workspaceFolder}/AAExport.ps1",
+            "args": [
+                "-Org", "mycompany",
+                "-Project", "myproject",
+                "-Team", "\"myteam\"",
+                "-Board", "\"Features Board\"",
+                "-WorkItemTypes", "Feature",
+                "-AreaPaths", "\"myproject\\myarea\"",
+                
+                // Custom Field Configuration
+                "-AdditionalFields", 
+                    "Parent=System.Parent", 
+                    "\"Value Area=Microsoft.VSTS.Common.ValueArea\"", 
+                    "AreaHierarchy", 
+                    "NodeName",
+        
+                "-FixDecreasingDates",
+                "-Output", "${workspaceFolder}/export.json",
+                "-Pat", "${env:ADO_PAT}"
+            ]
+        }
+    ]
+}
+```
