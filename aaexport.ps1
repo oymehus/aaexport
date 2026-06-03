@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Board,
     [Parameter(Mandatory=$true)][string]$Pat,
     [Parameter(Mandatory=$true)][string]$Output,
+    [ValidateSet('json', 'csv', 'excel')][string]$Format = 'json',
     [string[]]$WorkItemTypes, 
     [string[]]$AreaPaths,
     [string[]]$AdditionalFields,
@@ -13,6 +14,11 @@ param(
     [int]$HistoryLimit = 1000,
     [int]$ThrottleLimit = 8
 )
+
+# --- Auto-Correct File Extensions based on Format ---
+if ($Format -eq 'excel' -and $Output -match '\.(json|csv)$') { $Output = $Output -replace '\.(json|csv)$', '.xlsx' }
+elseif ($Format -eq 'csv' -and $Output -match '\.(json|xlsx)$') { $Output = $Output -replace '\.(json|xlsx)$', '.csv' }
+elseif ($Format -eq 'json' -and $Output -match '\.(csv|xlsx)$') { $Output = $Output -replace '\.(csv|xlsx)$', '.json' }
 
 # --- 0. Constants & Helpers ---
 $apiVersion = "7.0"
@@ -42,45 +48,58 @@ function Invoke-AdoRest {
 }
 
 function Get-ExistingCache {
-    param($Path, $TargetHeaders)
+    param($Path, $TargetHeaders, $Format)
     
     if (-not (Test-Path $Path)) { return $null }
 
     try {
         Write-Host "Reading existing file for incremental comparison..." -ForegroundColor Cyan
-        $jsonContent = Get-Content -Path $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($jsonContent.Count -lt 2) { return $null } 
-
-        # 1. Schema Check
-        $fileHeaders = $jsonContent[0]
-        $h1 = $fileHeaders -join "|"
-        $h2 = $TargetHeaders -join "|"
-        
-        if ($h1 -ne $h2) { 
-            Write-Warning "Schema mismatch detected (Columns changed). Forcing full reload."
-            return $null
-        }
-
-        # 2. Index Mapping
-        $idIndex = $fileHeaders.IndexOf("ID")
-        $changeIndex = $fileHeaders.IndexOf("Changed Date")
-
-        if ($idIndex -eq -1 -or $changeIndex -eq -1) {
-            Write-Warning "Existing file missing ID or Changed Date. Forcing full reload."
-            return $null
-        }
-
-        # 3. Build Hashtable
         $cache = @{}
-        for ($i = 1; $i -lt $jsonContent.Count; $i++) {
-            $row = $jsonContent[$i]
-            $id = $row[$idIndex]
-            
-            $cache[$id] = @{
-                Data = $row
-                ChangedDate = $row[$changeIndex] 
+
+        if ($Format -eq 'json') {
+            $jsonContent = Get-Content -Path $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($jsonContent.Count -lt 2) { return $null } 
+
+            $fileHeaders = $jsonContent[0]
+            if (($fileHeaders -join "|") -ne ($TargetHeaders -join "|")) { 
+                Write-Warning "Schema mismatch detected. Forcing full reload."
+                return $null 
+            }
+
+            $idIndex = $fileHeaders.IndexOf("ID")
+            $changeIndex = $fileHeaders.IndexOf("Changed Date")
+
+            if ($idIndex -eq -1 -or $changeIndex -eq -1) {
+                Write-Warning "Existing file missing ID or Changed Date. Forcing full reload."
+                return $null
+            }
+
+            for ($i = 1; $i -lt $jsonContent.Count; $i++) {
+                $row = $jsonContent[$i]
+                $objMap = [ordered]@{}
+                for ($c = 0; $c -lt $fileHeaders.Count; $c++) { $objMap[$fileHeaders[$c]] = $row[$c] }
+                $cache[$row[$idIndex]] = @{ Data = [PSCustomObject]$objMap; ChangedDate = $row[$changeIndex] }
             }
         }
+        elseif ($Format -eq 'csv') {
+            $csvContent = Import-Csv -Path $Path -Encoding UTF8
+            if (-not $csvContent -or $csvContent.Count -eq 0) { return $null }
+            
+            $fileHeaders = $csvContent[0].psobject.properties.name
+            if (($fileHeaders -join "|") -ne ($TargetHeaders -join "|")) { 
+                Write-Warning "Schema mismatch detected. Forcing full reload."
+                return $null 
+            }
+
+            foreach ($row in $csvContent) {
+                $cache[$row.ID] = @{ Data = $row; ChangedDate = $row."Changed Date" }
+            }
+        }
+        else {
+            Write-Warning "Incremental updates cannot read existing Excel (.xlsx) files directly. Starting fresh."
+            return $null
+        }
+
         return $cache
     }
     catch {
@@ -99,6 +118,8 @@ function Get-FlowMetricsRow {
         $FieldRefMap,
         $CalcFlags,
         $FixDecreasingDates,
+        $ColFieldRef,
+        $DoneFieldRef,
         $Headers
     )
 
@@ -112,13 +133,22 @@ function Get-FlowMetricsRow {
         $formattedTags = "[" + ($tagList -join "|") + "]"
     }
 
+    $changedDateStr = ""
+    if ($wiDetail.fields."System.ChangedDate") {
+        try { 
+            $changedDateStr = ([DateTime]$wiDetail.fields."System.ChangedDate").ToString("yyyy-MM-dd") 
+        } catch { 
+            $changedDateStr = $wiDetail.fields."System.ChangedDate" 
+        }
+    }
+
     $rowMap = [ordered]@{
         "ID" = $wiDetail.id
         "Link" = $wiDetail._links.html.href
         "Title" = $wiDetail.fields."System.Title"
         "Work Item Type" = $wiDetail.fields."System.WorkItemType"
         "Tags" = $formattedTags
-        "Changed Date" = $wiDetail.fields."System.ChangedDate" 
+        "Changed Date" = $changedDateStr 
     }
 
     # 2. Dynamic Field Injection
@@ -138,7 +168,11 @@ function Get-FlowMetricsRow {
     }
 
     foreach ($h in $FieldRefMap.Keys) {
-        $rowMap[$h] = $wiDetail.fields."$($FieldRefMap[$h])"
+        $val = $wiDetail.fields."$($FieldRefMap[$h])"
+        if ($val -match '^\d{4}-\d{2}-\d{2}T') {
+            try { $val = ([DateTime]$val).ToString("yyyy-MM-dd") } catch {}
+        }
+        $rowMap[$h] = $val
     }
 
     $rowMap["State"] = $wiDetail.fields."System.State"
@@ -148,7 +182,7 @@ function Get-FlowMetricsRow {
 
     foreach ($col in $BoardColumns) { $rowMap[$col] = $null }
 
-    # 3. History Replay (With Backflow Detection)
+    # 3. History Replay (With WEF Field Detection)
     $updates = Invoke-AdoRest -Url "$BaseUrl/_apis/wit/workitems/$($Id)/updates?api-version=$ApiVersion" -Headers $Headers
     
     $currentColName = $null
@@ -176,10 +210,21 @@ function Get-FlowMetricsRow {
             }
         }
 
-        # Column Logic
+        # Column Logic - Checking both WEF fields and System fields
         $hasColChange = $false
-        if ($update.fields -and $update.fields."System.BoardColumn") { $currentColName = $update.fields."System.BoardColumn".newValue; $currentIsDone = $false; $hasColChange = $true }
-        if ($update.fields -and $update.fields."System.BoardColumnDone") { $currentIsDone = [bool]$update.fields."System.BoardColumnDone".newValue; $hasColChange = $true }
+        
+        $colUpdate = if ($update.fields."$ColFieldRef") { $update.fields."$ColFieldRef" } else { $update.fields."System.BoardColumn" }
+        if ($colUpdate) { 
+            $currentColName = $colUpdate.newValue
+            $currentIsDone = $false
+            $hasColChange = $true 
+        }
+        
+        $doneUpdate = if ($update.fields."$DoneFieldRef") { $update.fields."$DoneFieldRef" } else { $update.fields."System.BoardColumnDone" }
+        if ($doneUpdate) { 
+            $currentIsDone = [bool]$doneUpdate.newValue
+            $hasColChange = $true 
+        }
 
         if ($hasColChange -and $currentColName) {
             $targetHeader = $currentColName
@@ -188,11 +233,9 @@ function Get-FlowMetricsRow {
             $targetIndex = $BoardColumns.IndexOf($targetHeader)
 
             if ($targetIndex -ge 0) {
-                # 1. Capture date
                 if (-not $rowMap[$targetHeader]) {
                     if ($currentDate) { $rowMap[$targetHeader] = $currentDate.ToString("yyyy-MM-dd") } 
                 }
-                # 2. Backflow Check
                 if ($targetIndex -lt $maxColIndexReached) {
                     for ($i = $targetIndex + 1; $i -le $maxColIndexReached; $i++) {
                         $colToClear = $BoardColumns[$i]
@@ -203,6 +246,30 @@ function Get-FlowMetricsRow {
                 else {
                     $maxColIndexReached = $targetIndex
                 }
+            }
+        }
+    }
+
+    # 3.5. Live State Anchor
+    # If the history replay missed the final column placement (e.g. State change bypass), force it here.
+    $liveCol = if ($wiDetail.fields."$ColFieldRef") { $wiDetail.fields."$ColFieldRef" } else { $wiDetail.fields."System.BoardColumn" }
+    $liveDone = if ($null -ne $wiDetail.fields."$DoneFieldRef") { $wiDetail.fields."$DoneFieldRef" } else { $wiDetail.fields."System.BoardColumnDone" }
+    
+    if ($liveCol) {
+        $liveTarget = $liveCol
+        if ($liveDone -and $SplitMap[$liveCol]) { $liveTarget = "$liveCol Done" }
+        
+        $liveTargetIndex = $BoardColumns.IndexOf($liveTarget)
+        if ($liveTargetIndex -ge 0 -and -not $rowMap[$liveTarget]) {
+            $anchorDateVal = $wiDetail.fields."Microsoft.VSTS.Common.StateChangeDate"
+            if (-not $anchorDateVal) { $anchorDateVal = $wiDetail.fields."System.ChangedDate" }
+            if ($anchorDateVal) {
+                try {
+                    $rowMap[$liveTarget] = ([DateTime]$anchorDateVal).ToString("yyyy-MM-dd")
+                } catch {
+                    $rowMap[$liveTarget] = $anchorDateVal
+                }
+                if ($liveTargetIndex -gt $maxColIndexReached) { $maxColIndexReached = $liveTargetIndex }
             }
         }
     }
@@ -218,7 +285,6 @@ function Get-FlowMetricsRow {
     # 4. Date Fix: Forward Fill (Stop at last data point)
     if ($FixDecreasingDates) {
         
-        # A. Identify the Rightmost Column that actually has a date
         $lastDataIndex = -1
         for ($i = $BoardColumns.Count - 1; $i -ge 0; $i--) {
             if (-not [string]::IsNullOrWhiteSpace($rowMap[$BoardColumns[$i]])) {
@@ -227,10 +293,8 @@ function Get-FlowMetricsRow {
             }
         }
 
-        # B. Forward Fill / Monotony Enforcement
         $runningMaxDate = [DateTime]::MinValue
         
-        # Initialize runningMax with CreatedDate
         if ($wiDetail.fields."System.CreatedDate") {
             $runningMaxDate = [DateTime]$wiDetail.fields."System.CreatedDate"
             if (-not $rowMap[$BoardColumns[0]]) {
@@ -260,7 +324,6 @@ function Get-FlowMetricsRow {
         }
     } 
     else {
-        # Fallback
         $createdDateVal = $wiDetail.fields."System.CreatedDate"
         if ($createdDateVal) {
             $createdDate = [DateTime]$createdDateVal
@@ -281,6 +344,10 @@ $boardConfig = $boards.value | Where-Object { $_.name -eq $Board }
 
 if (-not $boardConfig) { Write-Error "Board '$Board' not found."; exit 1 }
 
+$colFieldRef = if ($boardConfig.fields.columnField.referenceName) { $boardConfig.fields.columnField.referenceName } else { "System.BoardColumn" }
+$doneFieldRef = if ($boardConfig.fields.doneField.referenceName) { $boardConfig.fields.doneField.referenceName } else { "System.BoardColumnDone" }
+Write-Host "Resolved Board Fields: Column = $colFieldRef" -ForegroundColor DarkGray
+
 $columns = Invoke-AdoRest -Url "$($boardConfig.url)/columns?api-version=$apiVersion" -Headers $headers
 $boardColumns = @(); $splitMap = @{}
 foreach ($col in $columns.value) {
@@ -298,15 +365,13 @@ foreach ($fieldDef in $AdditionalFields) {
     else { $extraHeaders += $fieldDef; $fieldRefMap[$fieldDef] = $fieldDef }
 }
 
-$finalHeaders = @("ID", "Link", "Title", "Work Item Type", "Tags", "Changed Date") + $extraHeaders + @("State", "Area Path") + $boardColumns + @("Blocked", "Blocked Days")
+$finalHeaders = @("ID", "Link", "Title") + $boardColumns + @("Work Item Type", "Tags", "Changed Date") + $extraHeaders + @("State", "Area Path", "Blocked", "Blocked Days")
 
 # --- 3. Incremental Cache Load ---
 $cache = $null
 if ($IncrementalUpdate) {
-    $cache = Get-ExistingCache -Path $Output -TargetHeaders $finalHeaders
-    if ($cache) {
-        Write-Host "Cache loaded: $($cache.Count) items found." -ForegroundColor Cyan
-    }
+    $cache = Get-ExistingCache -Path $Output -TargetHeaders $finalHeaders -Format $Format
+    if ($cache) { Write-Host "Cache loaded: $($cache.Count) items found." -ForegroundColor Cyan }
 }
 
 # --- 4. Fetch Work Items (Lightweight) ---
@@ -330,7 +395,6 @@ else {
 }
 if ($targetAreas.Count -gt 0) { $areaClauses = $targetAreas | ForEach-Object { "[System.AreaPath] UNDER '$_'" }; $areaWhere = "AND ( " + ($areaClauses -join " OR ") + " )" }
 
-# Fetch ID AND ChangedDate for comparison
 $wiql = "SELECT [System.Id], [System.ChangedDate] FROM WorkItems WHERE [System.TeamProject] = '$Project' $typeWhere $areaWhere ORDER BY [System.ChangedDate] DESC"
 $queryResponse = Invoke-RestMethod -Uri "$baseUrl/_apis/wit/wiql?api-version=$apiVersion" -Method Post -Headers $headers -Body (@{ query = $wiql } | ConvertTo-Json) -ContentType "application/json"
 $rawWorkItems = $queryResponse.workItems | Select-Object -First $HistoryLimit
@@ -341,11 +405,8 @@ $cachedRowsToKeep = [System.Collections.Generic.List[Object]]::new()
 
 if ($cache) {
     Write-Host "Calculating delta..." -ForegroundColor Cyan
-    $newCount = 0
-    $changeCount = 0
-    $skipCount = 0
+    $newCount = 0; $changeCount = 0; $skipCount = 0
     
-    # Batch Fetch Dates to do the comparison
     $allIds = $rawWorkItems.id
     $start = 0
     while ($allIds -and $start -lt $allIds.Count) {
@@ -362,13 +423,11 @@ if ($cache) {
             
             if ($cache.ContainsKey($id)) {
                 $cachedDateStr = $cache[$id].ChangedDate
-                
                 $isMatch = $false
                 if ($serverDateStr -and $cachedDateStr) {
                     try {
-                        $dtServer = [DateTime]$serverDateStr
-                        $dtCache  = [DateTime]$cachedDateStr
-                        if ($dtServer -eq $dtCache) { $isMatch = $true }
+                        $dtServer = [DateTime]$serverDateStr; $dtCache = [DateTime]$cachedDateStr
+                        if ($dtServer.ToString("yyyy-MM-dd") -eq $dtCache.ToString("yyyy-MM-dd")) { $isMatch = $true }
                     } catch {
                         if ($serverDateStr -eq $cachedDateStr) { $isMatch = $true }
                     }
@@ -392,7 +451,7 @@ if ($cache) {
     foreach($item in $rawWorkItems) { $itemsToProcess.Add($item) }
 }
 
-# --- 6. Process Loop (Parallel/Sequential) ---
+# --- 6. Process Loop ---
 $psVersion = $PSVersionTable.PSVersion.Major
 $processedResults = [System.Collections.Generic.List[Object]]::new()
 
@@ -401,7 +460,6 @@ if ($itemsToProcess.Count -gt 0) {
         Write-Host "Processing $($itemsToProcess.Count) items in Parallel..." -ForegroundColor Yellow
         $funcInvokeRest = ${function:Invoke-AdoRest}.ToString()
         $funcGetRow = ${function:Get-FlowMetricsRow}.ToString()
-        
         $itemsArray = $itemsToProcess.ToArray()
 
         $pResults = $itemsArray | ForEach-Object -Parallel {
@@ -417,21 +475,17 @@ if ($itemsToProcess.Count -gt 0) {
                 -FieldRefMap $using:fieldRefMap `
                 -CalcFlags $using:calcFlags `
                 -FixDecreasingDates $using:FixDecreasingDates `
+                -ColFieldRef $using:colFieldRef `
+                -DoneFieldRef $using:doneFieldRef `
                 -Headers $using:headers
-            
-            # Console Feedback
-            # if ($_.id % 10 -eq 0) { Write-Host "." -NoNewline }
             return [PSCustomObject]$row
         } -ThrottleLimit $ThrottleLimit
 
         foreach($r in $pResults) { $processedResults.Add($r) }
-        Write-Host ""
     } 
     else {
         Write-Host "Processing $($itemsToProcess.Count) items Sequentially..." -ForegroundColor Yellow
-        $current = 0
-        $total = $itemsToProcess.Count
-        
+        $current = 0; $total = $itemsToProcess.Count
         foreach ($item in $itemsToProcess) {
             $current++
             $row = Get-FlowMetricsRow `
@@ -443,6 +497,8 @@ if ($itemsToProcess.Count -gt 0) {
                 -FieldRefMap $fieldRefMap `
                 -CalcFlags $calcFlags `
                 -FixDecreasingDates $FixDecreasingDates `
+                -ColFieldRef $colFieldRef `
+                -DoneFieldRef $doneFieldRef `
                 -Headers $headers
 
             $processedResults.Add([PSCustomObject]$row)
@@ -452,42 +508,83 @@ if ($itemsToProcess.Count -gt 0) {
 }
 
 # --- 7. Merge and Export ---
-Write-Host "Merging & Exporting..." -ForegroundColor Cyan
+Write-Host "Merging & Exporting to $Format format..." -ForegroundColor Cyan
 
-$jsonRows = [System.Collections.Generic.List[String]]::new()
+$allData = [System.Collections.Generic.List[PSCustomObject]]::new()
+foreach($c in $cachedRowsToKeep) { $allData.Add($c) }
+foreach($p in $processedResults) { $allData.Add($p) }
 
-function Format-JsonStr { 
-    param($s) 
-    if ($s -is [DateTime]) {
-        return '"' + $s.ToString("yyyy-MM-ddTHH:mm:ss.fffZ") + '"'
+if ($Format -eq 'json') {
+    $jsonRows = [System.Collections.Generic.List[String]]::new()
+    function Format-JsonStr { 
+        param($s) 
+        if ($s -is [DateTime]) { return '"' + $s.ToString("yyyy-MM-dd") + '"' }
+        return '"' + $s.ToString().Replace('\', '\\').Replace('"', '\"') + '"' 
     }
-    return '"' + $s.ToString().Replace('\', '\\').Replace('"', '\"') + '"' 
+
+    $headerStr = "[" + (($finalHeaders | ForEach-Object { Format-JsonStr $_ }) -join ",") + "]"
+    $jsonRows.Add($headerStr)
+
+    foreach ($item in $allData) {
+        $rowValues = @()
+        foreach ($h in $finalHeaders) {
+            $val = $item.$h
+            if ($null -eq $val) { $val = "" }
+            $rowValues += Format-JsonStr $val
+        }
+        $jsonRows.Add("[" + ($rowValues -join ",") + "]")
+    }
+
+    $finalJson = "[" + [Environment]::NewLine + ($jsonRows -join "," + [Environment]::NewLine) + [Environment]::NewLine + "]"
+    $finalJson | Set-Content -Path $Output -Encoding UTF8
+
+} elseif ($Format -eq 'csv' -or $Format -eq 'excel') {
+    $excelSuccess = $false
+
+    if ($Format -eq 'excel') {
+        $absOutput = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output) -replace '/', '\'
+        $outDir = Split-Path $absOutput
+        if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
+        if (Test-Path $absOutput) { Remove-Item $absOutput -Force }
+
+        $tempCsv = Join-Path $outDir ("~temp_" + [System.Guid]::NewGuid().ToString().Substring(0,8) + ".csv")
+        $allData | Select-Object $finalHeaders | Export-Csv -Path $tempCsv -NoTypeInformation -Encoding UTF8 -UseCulture
+
+        try {
+            Write-Host "Invoking Excel COM Object for native .xlsx conversion..." -ForegroundColor Gray
+            $excel = New-Object -ComObject Excel.Application
+            $excel.DisplayAlerts = $false
+            $wb = $excel.Workbooks.Open($tempCsv)
+            
+            $wb.Worksheets.Item(1).Rows.Item(1).Font.Bold = $true
+            
+            $wb.SaveAs($absOutput, 51) # 51 = xlOpenXMLWorkbook (.xlsx)
+            
+            if (Test-Path $absOutput) {
+                $excelSuccess = $true
+            } else {
+                Write-Warning "Excel reported success but the file was not found at: $absOutput"
+            }
+            
+        } catch {
+            Write-Warning "Failed to generate native Excel file: $($_.Exception.Message)"
+        } finally {
+            if ($null -ne $wb) { try { $wb.Close($false) } catch {} }
+            if ($null -ne $excel) { 
+                try { $excel.Quit() } catch {}
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+            }
+            if (Test-Path $tempCsv) { Remove-Item $tempCsv -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    if ($Format -eq 'csv' -or -not $excelSuccess) {
+        if (-not $excelSuccess -and $Format -eq 'excel') {
+            Write-Warning "Falling back to standard CSV format."
+            $Output = $Output -replace '\.xlsx$', '.csv'
+        }
+        $allData | Select-Object $finalHeaders | Export-Csv -Path $Output -NoTypeInformation -Encoding UTF8
+    }
 }
 
-# Header
-$headerStr = "[" + (($finalHeaders | ForEach-Object { Format-JsonStr $_ }) -join ",") + "]"
-$jsonRows.Add($headerStr)
-
-# Add Cached Rows
-foreach ($rowArr in $cachedRowsToKeep) {
-    $quoted = @()
-    foreach($cell in $rowArr) {
-        $quoted += Format-JsonStr $cell
-    }
-    $jsonRows.Add("[" + ($quoted -join ",") + "]")
-}
-
-# Add New Rows
-foreach ($item in $processedResults) {
-    $rowValues = @()
-    foreach ($h in $finalHeaders) {
-        $val = $item.$h
-        if ($null -eq $val) { $val = "" }
-        $rowValues += Format-JsonStr $val
-    }
-    $jsonRows.Add("[" + ($rowValues -join ",") + "]")
-}
-
-$finalJson = "[" + [Environment]::NewLine + ($jsonRows -join "," + [Environment]::NewLine) + [Environment]::NewLine + "]"
-$finalJson | Set-Content -Path $Output -Encoding UTF8
-Write-Host "Export complete! JSON saved to: $Output" -ForegroundColor Green
+Write-Host "Export complete! File saved to: $Output" -ForegroundColor Green
