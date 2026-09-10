@@ -12,6 +12,7 @@ This tool bridges the gap for users with a standalone SaaS license for Actionabl
 * **Split Column Support:** Automatically detects "Doing/Done" split columns and exports them as separate stages (e.g., `Develop` and `Develop Done`).
 * **Blocked Days Calculation:** Calculates the total days an item was flagged as "Blocked", excluding same-day blocks.
 * **Hierarchy Extraction:** Can explode the Area Path into 7 distinct levels (`Area Level 1-7`) and extract the leaf `Node Name` for detailed filtering.
+* **Canonical Area Paths:** Resolves Area Path from the project classification tree using each work item's stable Area ID, so exports stay correct after Area nodes are moved or renamed, in every state and on both full and incremental runs.
 * **Data Sanitization:** Optional `-FixDecreasingDates` switch to auto-correct "backward movement" timestamps that break cumulative flow diagrams.
 
 ## Output Structure
@@ -33,6 +34,8 @@ This script is designed to run in restricted corporate environments where PowerS
 | **PowerShell 5.1** | **Sequential** | **Standard Speed.** Fetches items one by one. Fully compatible with standard corporate Windows builds. |
 
 *Note on Excel format:* The `-Format excel` option utilizes the Windows Excel COM Object. If Microsoft Excel is not installed on the machine running the script, it will safely fall back to generating a standard CSV file.
+
+*Note on moved Area Paths:* `System.AreaPath` is a denormalised copy of the classification node's location, which Azure DevOps reconciles with a background job after a node is moved or renamed. That reconciliation can lag or be skipped for work items excluded from backlog and board processing, which is why states such as Removed and Rejected are the most visible symptom. Incremental exports compound the problem, because a node move does not change a work item's `Changed Date`, so a reused row would keep the old path indefinitely. AAExport therefore resolves every row, freshly fetched or reused, from the current classification tree using the work item's stable `System.AreaId`.
 
 ## Usage
 The script is controlled entirely via command-line arguments.

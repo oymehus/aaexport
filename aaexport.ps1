@@ -48,6 +48,138 @@ function Invoke-AdoRest {
     }
 }
 
+function Add-AreaNodePaths {
+    param(
+        $Node,
+        [hashtable]$AreaPathMap
+    )
+
+    # Paths are composed from node names rather than taken from node.path,
+    # because the classification API returns paths that include the "Area" root
+    # segment (\Project\Area\Team) which work item System.AreaPath values omit
+    # (Project\Team). Composing from names also avoids localisation of that
+    # root segment.
+    # The walk is iterative to avoid recursion limits on deep trees and the
+    # PowerShell pitfall where @($node.children) on a leaf yields one $null item.
+    if ($null -eq $Node) { return }
+
+    $stack = [System.Collections.Stack]::new()
+    $stack.Push([pscustomobject]@{ Node = $Node; Path = $null })
+
+    while ($stack.Count -gt 0) {
+        $entry = $stack.Pop()
+        $current = $entry.Node
+        if ($null -eq $current) { continue }
+
+        $name = [string]$current.name
+        $path = if ([string]::IsNullOrEmpty($entry.Path)) { $name } else { "$($entry.Path)\$name" }
+
+        if ($null -ne $current.id -and -not [string]::IsNullOrWhiteSpace($path)) {
+            $AreaPathMap[[string]$current.id] = $path
+        }
+
+        $children = $current.children
+        if ($null -ne $children) {
+            foreach ($child in $children) {
+                if ($null -ne $child) {
+                    $stack.Push([pscustomobject]@{ Node = $child; Path = $path })
+                }
+            }
+        }
+    }
+}
+
+function Get-AreaPathMap {
+    param(
+        $BaseUrl,
+        $ApiVersion,
+        $Headers
+    )
+
+    # Resolved directly (not via Invoke-AdoRest) so that a failure here degrades
+    # gracefully instead of terminating the whole export: Invoke-AdoRest calls
+    # exit after retries, which would abort the run before any file is written.
+    $areaPathMap = @{}
+    try {
+        $areaTree = Invoke-RestMethod -Uri "$BaseUrl/_apis/wit/classificationnodes/areas?`$depth=14&api-version=$ApiVersion" -Method Get -Headers $Headers -ContentType "application/json" -ErrorAction Stop
+        Add-AreaNodePaths -Node $areaTree -AreaPathMap $areaPathMap
+    }
+    catch {
+        Write-Warning "Could not load the Area Path classification tree ($($_.Exception.Message)). Area Path values will use each work item's System.AreaPath as-is."
+        return @{}
+    }
+
+    return $areaPathMap
+}
+
+function Resolve-AreaPath {
+    param(
+        $Fields,
+        [hashtable]$AreaPathMap,
+        $WorkItemId,
+        $AreaId
+    )
+
+    # System.AreaId is the stable identifier for a classification node, while
+    # System.AreaPath is a denormalised copy that Azure DevOps reconciles with a
+    # background job after a node is moved or renamed. That reconciliation can
+    # lag or be skipped for work items excluded from backlog and board
+    # processing, such as Removed and Rejected, which leaves the path stale on
+    # the live item. Resolving the id against the current classification tree
+    # keeps the export correct regardless of that lag.
+    $resolvedId = if ($AreaId) { [string]$AreaId } else { [string]$Fields."System.AreaId" }
+
+    if ($resolvedId) {
+        if ($AreaPathMap.ContainsKey($resolvedId)) {
+            return $AreaPathMap[$resolvedId]
+        }
+        if ($AreaPathMap.Count -gt 0) {
+            Write-Warning "Could not resolve Area ID '$resolvedId' for work item $WorkItemId from the current classification tree. Using System.AreaPath."
+        }
+    }
+
+    return $Fields."System.AreaPath"
+}
+
+function Set-RowValue {
+    param(
+        $Row,
+        [string]$Name,
+        $Value
+    )
+
+    if ($Row -is [System.Collections.IDictionary]) {
+        $Row[$Name] = $Value
+        return
+    }
+
+    $property = $Row.PSObject.Properties[$Name]
+    if ($property) {
+        $property.Value = $Value
+    }
+}
+
+function Set-AreaPathMetadata {
+    param(
+        $RowMap,
+        [string]$AreaPath,
+        [System.Collections.IDictionary]$CalcFlags
+    )
+
+    $areaParts = $AreaPath -split '\\'
+
+    if ($CalcFlags["NodeName"]) { Set-RowValue -Row $RowMap -Name "Node Name" -Value $areaParts[-1] }
+
+    if ($CalcFlags["AreaHierarchy"]) {
+        for ($i = 0; $i -lt 7; $i++) {
+            $value = if ($areaParts.Count -gt $i) { $areaParts[$i] } else { "" }
+            Set-RowValue -Row $RowMap -Name "Area Level $($i + 1)" -Value $value
+        }
+    }
+
+    Set-RowValue -Row $RowMap -Name "Area Path" -Value $AreaPath
+}
+
 function Get-ExistingCache {
     param($Path, $TargetHeaders, $Format)
     
@@ -121,6 +253,8 @@ function Get-FlowMetricsRow {
         $FixDecreasingDates,
         $ColFieldRef,
         $DoneFieldRef,
+        $AreaPathMap,
+        $AreaId,
         $IncludeChildCount,
         $Headers
     )
@@ -155,20 +289,8 @@ function Get-FlowMetricsRow {
     }
 
     # 2. Dynamic Field Injection
-    $fullAreaPath = $wiDetail.fields."System.AreaPath"
-    $areaParts = $fullAreaPath -split '\\'
-
-    if ($CalcFlags["NodeName"]) { $rowMap["Node Name"] = $areaParts[-1] }
-
-    if ($CalcFlags["AreaHierarchy"]) {
-        $rowMap["Area Level 1"] = if ($areaParts.Count -gt 0) { $areaParts[0] } else { "" }
-        $rowMap["Area Level 2"] = if ($areaParts.Count -gt 1) { $areaParts[1] } else { "" }
-        $rowMap["Area Level 3"] = if ($areaParts.Count -gt 2) { $areaParts[2] } else { "" }
-        $rowMap["Area Level 4"] = if ($areaParts.Count -gt 3) { $areaParts[3] } else { "" }
-        $rowMap["Area Level 5"] = if ($areaParts.Count -gt 4) { $areaParts[4] } else { "" }
-        $rowMap["Area Level 6"] = if ($areaParts.Count -gt 5) { $areaParts[5] } else { "" }
-        $rowMap["Area Level 7"] = if ($areaParts.Count -gt 6) { $areaParts[6] } else { "" }
-    }
+    $fullAreaPath = Resolve-AreaPath -Fields $wiDetail.fields -AreaPathMap $AreaPathMap -WorkItemId $wiDetail.id -AreaId $AreaId
+    Set-AreaPathMetadata -RowMap $rowMap -AreaPath $fullAreaPath -CalcFlags $CalcFlags
 
     foreach ($h in $FieldRefMap.Keys) {
         $val = $wiDetail.fields."$($FieldRefMap[$h])"
@@ -179,7 +301,6 @@ function Get-FlowMetricsRow {
     }
 
     $rowMap["State"] = $wiDetail.fields."System.State"
-    $rowMap["Area Path"] = $fullAreaPath
     $rowMap["Blocked"] = $wiDetail.fields."Microsoft.VSTS.CMMI.Blocked"
     $rowMap["Blocked Days"] = 0
 
@@ -348,6 +469,9 @@ $boardConfig = $boards.value | Where-Object { $_.name -eq $Board }
 
 if (-not $boardConfig) { Write-Error "Board '$Board' not found."; exit 1 }
 
+$areaPathMap = Get-AreaPathMap -BaseUrl $baseUrl -ApiVersion $apiVersion -Headers $headers
+Write-Host "Loaded $($areaPathMap.Count) canonical Area Paths." -ForegroundColor DarkGray
+
 $colFieldRef = if ($boardConfig.fields.columnField.referenceName) { $boardConfig.fields.columnField.referenceName } else { "System.BoardColumn" }
 $doneFieldRef = if ($boardConfig.fields.doneField.referenceName) { $boardConfig.fields.doneField.referenceName } else { "System.BoardColumnDone" }
 Write-Host "Resolved Board Fields: Column = $colFieldRef" -ForegroundColor DarkGray
@@ -409,47 +533,63 @@ $rawWorkItems = $queryResponse.workItems | Select-Object -First $HistoryLimit
 $itemsToProcess = [System.Collections.Generic.List[Object]]::new()
 $cachedRowsToKeep = [System.Collections.Generic.List[Object]]::new()
 
+# Lightweight metadata for every item in scope. This always runs because
+# System.AreaId is only returned when requested through the fields= option,
+# which cannot be combined with the $expand used for the full item fetch.
+# Without it a full (non-incremental) export could not detect a stale
+# System.AreaPath left behind by a moved classification node.
+$areaIdLookup = @{}
+$batchedItems = [System.Collections.Generic.List[Object]]::new()
+$allIds = @($rawWorkItems.id)
+$start = 0
+while ($start -lt $allIds.Count) {
+    $count = [Math]::Min(200, $allIds.Count - $start)
+    $batchIds = $allIds[$start..($start + $count - 1)]
+    $start += $count
+
+    $batchUrl = "$baseUrl/_apis/wit/workitems?ids=$($batchIds -join ',')&fields=System.Id,System.ChangedDate,System.AreaId,System.AreaPath&api-version=$apiVersion"
+    $batchResponse = Invoke-AdoRest -Url $batchUrl -Headers $headers
+
+    foreach ($wi in $batchResponse.value) {
+        $batchedItems.Add($wi)
+        $areaId = [string]$wi.fields."System.AreaId"
+        if ($areaId) { $areaIdLookup[[string]$wi.id] = $areaId }
+    }
+}
+
 if ($cache) {
     Write-Host "Calculating delta..." -ForegroundColor Cyan
     $newCount = 0; $changeCount = 0; $skipCount = 0
-    
-    $allIds = $rawWorkItems.id
-    $start = 0
-    while ($allIds -and $start -lt $allIds.Count) {
-        $count = [Math]::Min(200, $allIds.Count - $start)
-        $batchIds = $allIds[$start..($start + $count - 1)]
-        $start += $count
-        
-        $batchUrl = "$baseUrl/_apis/wit/workitems?ids=$($batchIds -join ',')&fields=System.Id,System.ChangedDate&api-version=$apiVersion"
-        $batchResponse = Invoke-AdoRest -Url $batchUrl -Headers $headers
-        
-        foreach ($wi in $batchResponse.value) {
-            $id = [string]$wi.id
-            $serverDateStr = $wi.fields."System.ChangedDate"
-            
-            if ($cache.ContainsKey($id)) {
-                $cachedDateStr = $cache[$id].ChangedDate
-                $isMatch = $false
-                if ($serverDateStr -and $cachedDateStr) {
-                    try {
-                        $dtServer = [DateTime]$serverDateStr; $dtCache = [DateTime]$cachedDateStr
-                        if ($dtServer.ToString("yyyy-MM-dd") -eq $dtCache.ToString("yyyy-MM-dd")) { $isMatch = $true }
-                    } catch {
-                        if ($serverDateStr -eq $cachedDateStr) { $isMatch = $true }
-                    }
-                }
 
-                if ($isMatch) {
-                    $cachedRowsToKeep.Add($cache[$id].Data)
-                    $skipCount++
-                } else {
-                    $itemsToProcess.Add($wi)
-                    $changeCount++
+    foreach ($wi in $batchedItems) {
+        $id = [string]$wi.id
+        $serverDateStr = $wi.fields."System.ChangedDate"
+
+        if ($cache.ContainsKey($id)) {
+            $cachedDateStr = $cache[$id].ChangedDate
+            $isMatch = $false
+            if ($serverDateStr -and $cachedDateStr) {
+                try {
+                    $dtServer = [DateTime]$serverDateStr; $dtCache = [DateTime]$cachedDateStr
+                    if ($dtServer.ToString("yyyy-MM-dd") -eq $dtCache.ToString("yyyy-MM-dd")) { $isMatch = $true }
+                } catch {
+                    if ($serverDateStr -eq $cachedDateStr) { $isMatch = $true }
                 }
+            }
+
+            if ($isMatch) {
+                $cachedRow = $cache[$id].Data
+                $canonicalAreaPath = Resolve-AreaPath -Fields $wi.fields -AreaPathMap $areaPathMap -WorkItemId $wi.id
+                Set-AreaPathMetadata -RowMap $cachedRow -AreaPath $canonicalAreaPath -CalcFlags $calcFlags
+                $cachedRowsToKeep.Add($cachedRow)
+                $skipCount++
             } else {
                 $itemsToProcess.Add($wi)
-                $newCount++
+                $changeCount++
             }
+        } else {
+            $itemsToProcess.Add($wi)
+            $newCount++
         }
     }
     Write-Host "Delta: $newCount New, $changeCount Changed, $skipCount Skipped." -ForegroundColor Yellow
@@ -466,11 +606,17 @@ if ($itemsToProcess.Count -gt 0) {
         Write-Host "Processing $($itemsToProcess.Count) items in Parallel..." -ForegroundColor Yellow
         $funcInvokeRest = ${function:Invoke-AdoRest}.ToString()
         $funcGetRow = ${function:Get-FlowMetricsRow}.ToString()
+        $funcResolveAreaPath = ${function:Resolve-AreaPath}.ToString()
+        $funcSetRowValue = ${function:Set-RowValue}.ToString()
+        $funcSetAreaPathMetadata = ${function:Set-AreaPathMetadata}.ToString()
         $itemsArray = $itemsToProcess.ToArray()
 
         $pResults = $itemsArray | ForEach-Object -Parallel {
             ${function:Invoke-AdoRest} = $using:funcInvokeRest
             ${function:Get-FlowMetricsRow} = $using:funcGetRow
+            ${function:Resolve-AreaPath} = $using:funcResolveAreaPath
+            ${function:Set-RowValue} = $using:funcSetRowValue
+            ${function:Set-AreaPathMetadata} = $using:funcSetAreaPathMetadata
             
             $row = Get-FlowMetricsRow `
                 -Id $_.id `
@@ -483,6 +629,8 @@ if ($itemsToProcess.Count -gt 0) {
                 -FixDecreasingDates $using:FixDecreasingDates `
                 -ColFieldRef $using:colFieldRef `
                 -DoneFieldRef $using:doneFieldRef `
+                -AreaPathMap $using:areaPathMap `
+                -AreaId ($using:areaIdLookup)[[string]$_.id] `
                 -IncludeChildCount $using:ChildCount `
                 -Headers $using:headers
             return [PSCustomObject]$row
@@ -506,6 +654,8 @@ if ($itemsToProcess.Count -gt 0) {
                 -FixDecreasingDates $FixDecreasingDates `
                 -ColFieldRef $colFieldRef `
                 -DoneFieldRef $doneFieldRef `
+                -AreaPathMap $areaPathMap `
+                -AreaId $areaIdLookup[[string]$item.id] `
                 -IncludeChildCount $ChildCount `
                 -Headers $headers
 
