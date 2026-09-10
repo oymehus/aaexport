@@ -116,21 +116,25 @@ function Resolve-AreaPath {
     param(
         $Fields,
         [hashtable]$AreaPathMap,
-        $WorkItemId
+        $WorkItemId,
+        $AreaId
     )
 
-    # System.AreaId is only returned when explicitly requested via the fields=
-    # query option, which cannot be combined with $expand. When it is absent the
-    # work item was read live, so System.AreaPath is already canonical and is
-    # used as-is. The id lookup matters for rows reused from the incremental
-    # cache, where a moved classification node leaves the stored path stale.
-    $areaId = [string]$Fields."System.AreaId"
-    if ($areaId) {
-        if ($AreaPathMap.ContainsKey($areaId)) {
-            return $AreaPathMap[$areaId]
+    # System.AreaId is the stable identifier for a classification node, while
+    # System.AreaPath is a denormalised copy that Azure DevOps reconciles with a
+    # background job after a node is moved or renamed. That reconciliation can
+    # lag or be skipped for work items excluded from backlog and board
+    # processing, such as Removed and Rejected, which leaves the path stale on
+    # the live item. Resolving the id against the current classification tree
+    # keeps the export correct regardless of that lag.
+    $resolvedId = if ($AreaId) { [string]$AreaId } else { [string]$Fields."System.AreaId" }
+
+    if ($resolvedId) {
+        if ($AreaPathMap.ContainsKey($resolvedId)) {
+            return $AreaPathMap[$resolvedId]
         }
         if ($AreaPathMap.Count -gt 0) {
-            Write-Warning "Could not resolve Area ID '$areaId' for work item $WorkItemId from the current classification tree. Using System.AreaPath."
+            Write-Warning "Could not resolve Area ID '$resolvedId' for work item $WorkItemId from the current classification tree. Using System.AreaPath."
         }
     }
 
@@ -250,6 +254,7 @@ function Get-FlowMetricsRow {
         $ColFieldRef,
         $DoneFieldRef,
         $AreaPathMap,
+        $AreaId,
         $IncludeChildCount,
         $Headers
     )
@@ -284,7 +289,7 @@ function Get-FlowMetricsRow {
     }
 
     # 2. Dynamic Field Injection
-    $fullAreaPath = Resolve-AreaPath -Fields $wiDetail.fields -AreaPathMap $AreaPathMap -WorkItemId $wiDetail.id
+    $fullAreaPath = Resolve-AreaPath -Fields $wiDetail.fields -AreaPathMap $AreaPathMap -WorkItemId $wiDetail.id -AreaId $AreaId
     Set-AreaPathMetadata -RowMap $rowMap -AreaPath $fullAreaPath -CalcFlags $CalcFlags
 
     foreach ($h in $FieldRefMap.Keys) {
@@ -528,50 +533,63 @@ $rawWorkItems = $queryResponse.workItems | Select-Object -First $HistoryLimit
 $itemsToProcess = [System.Collections.Generic.List[Object]]::new()
 $cachedRowsToKeep = [System.Collections.Generic.List[Object]]::new()
 
+# Lightweight metadata for every item in scope. This always runs because
+# System.AreaId is only returned when requested through the fields= option,
+# which cannot be combined with the $expand used for the full item fetch.
+# Without it a full (non-incremental) export could not detect a stale
+# System.AreaPath left behind by a moved classification node.
+$areaIdLookup = @{}
+$batchedItems = [System.Collections.Generic.List[Object]]::new()
+$allIds = @($rawWorkItems.id)
+$start = 0
+while ($start -lt $allIds.Count) {
+    $count = [Math]::Min(200, $allIds.Count - $start)
+    $batchIds = $allIds[$start..($start + $count - 1)]
+    $start += $count
+
+    $batchUrl = "$baseUrl/_apis/wit/workitems?ids=$($batchIds -join ',')&fields=System.Id,System.ChangedDate,System.AreaId,System.AreaPath&api-version=$apiVersion"
+    $batchResponse = Invoke-AdoRest -Url $batchUrl -Headers $headers
+
+    foreach ($wi in $batchResponse.value) {
+        $batchedItems.Add($wi)
+        $areaId = [string]$wi.fields."System.AreaId"
+        if ($areaId) { $areaIdLookup[[string]$wi.id] = $areaId }
+    }
+}
+
 if ($cache) {
     Write-Host "Calculating delta..." -ForegroundColor Cyan
     $newCount = 0; $changeCount = 0; $skipCount = 0
-    
-    $allIds = $rawWorkItems.id
-    $start = 0
-    while ($allIds -and $start -lt $allIds.Count) {
-        $count = [Math]::Min(200, $allIds.Count - $start)
-        $batchIds = $allIds[$start..($start + $count - 1)]
-        $start += $count
-        
-        $batchUrl = "$baseUrl/_apis/wit/workitems?ids=$($batchIds -join ',')&fields=System.Id,System.ChangedDate,System.AreaId,System.AreaPath&api-version=$apiVersion"
-        $batchResponse = Invoke-AdoRest -Url $batchUrl -Headers $headers
-        
-        foreach ($wi in $batchResponse.value) {
-            $id = [string]$wi.id
-            $serverDateStr = $wi.fields."System.ChangedDate"
-            
-            if ($cache.ContainsKey($id)) {
-                $cachedDateStr = $cache[$id].ChangedDate
-                $isMatch = $false
-                if ($serverDateStr -and $cachedDateStr) {
-                    try {
-                        $dtServer = [DateTime]$serverDateStr; $dtCache = [DateTime]$cachedDateStr
-                        if ($dtServer.ToString("yyyy-MM-dd") -eq $dtCache.ToString("yyyy-MM-dd")) { $isMatch = $true }
-                    } catch {
-                        if ($serverDateStr -eq $cachedDateStr) { $isMatch = $true }
-                    }
-                }
 
-                if ($isMatch) {
-                    $cachedRow = $cache[$id].Data
-                    $canonicalAreaPath = Resolve-AreaPath -Fields $wi.fields -AreaPathMap $areaPathMap -WorkItemId $wi.id
-                    Set-AreaPathMetadata -RowMap $cachedRow -AreaPath $canonicalAreaPath -CalcFlags $calcFlags
-                    $cachedRowsToKeep.Add($cachedRow)
-                    $skipCount++
-                } else {
-                    $itemsToProcess.Add($wi)
-                    $changeCount++
+    foreach ($wi in $batchedItems) {
+        $id = [string]$wi.id
+        $serverDateStr = $wi.fields."System.ChangedDate"
+
+        if ($cache.ContainsKey($id)) {
+            $cachedDateStr = $cache[$id].ChangedDate
+            $isMatch = $false
+            if ($serverDateStr -and $cachedDateStr) {
+                try {
+                    $dtServer = [DateTime]$serverDateStr; $dtCache = [DateTime]$cachedDateStr
+                    if ($dtServer.ToString("yyyy-MM-dd") -eq $dtCache.ToString("yyyy-MM-dd")) { $isMatch = $true }
+                } catch {
+                    if ($serverDateStr -eq $cachedDateStr) { $isMatch = $true }
                 }
+            }
+
+            if ($isMatch) {
+                $cachedRow = $cache[$id].Data
+                $canonicalAreaPath = Resolve-AreaPath -Fields $wi.fields -AreaPathMap $areaPathMap -WorkItemId $wi.id
+                Set-AreaPathMetadata -RowMap $cachedRow -AreaPath $canonicalAreaPath -CalcFlags $calcFlags
+                $cachedRowsToKeep.Add($cachedRow)
+                $skipCount++
             } else {
                 $itemsToProcess.Add($wi)
-                $newCount++
+                $changeCount++
             }
+        } else {
+            $itemsToProcess.Add($wi)
+            $newCount++
         }
     }
     Write-Host "Delta: $newCount New, $changeCount Changed, $skipCount Skipped." -ForegroundColor Yellow
@@ -612,6 +630,7 @@ if ($itemsToProcess.Count -gt 0) {
                 -ColFieldRef $using:colFieldRef `
                 -DoneFieldRef $using:doneFieldRef `
                 -AreaPathMap $using:areaPathMap `
+                -AreaId ($using:areaIdLookup)[[string]$_.id] `
                 -IncludeChildCount $using:ChildCount `
                 -Headers $using:headers
             return [PSCustomObject]$row
@@ -636,6 +655,7 @@ if ($itemsToProcess.Count -gt 0) {
                 -ColFieldRef $colFieldRef `
                 -DoneFieldRef $doneFieldRef `
                 -AreaPathMap $areaPathMap `
+                -AreaId $areaIdLookup[[string]$item.id] `
                 -IncludeChildCount $ChildCount `
                 -Headers $headers
 
