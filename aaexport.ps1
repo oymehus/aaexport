@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Project,
     [Parameter(Mandatory=$true)][string]$Team,
     [Parameter(Mandatory=$true)][string]$Board,
-    [Parameter(Mandatory=$true)][string]$Pat,
+    [string]$Pat,
     [Parameter(Mandatory=$true)][string]$Output,
     [ValidateSet('json', 'csv', 'excel')][string]$Format = 'json',
     [string[]]$WorkItemTypes, 
@@ -15,6 +15,15 @@ param(
     [int]$HistoryLimit = 1000,
     [int]$ThrottleLimit = 8
 )
+
+# --- Personal Access Token resolution ---
+# Falls back to the ADO_PAT environment variable so the token never has to be
+# written into launch.json, shell history or CI definitions.
+if ([string]::IsNullOrWhiteSpace($Pat)) { $Pat = $env:ADO_PAT }
+if ([string]::IsNullOrWhiteSpace($Pat)) {
+    Write-Error "No Personal Access Token supplied. Pass -Pat, or set the ADO_PAT environment variable (e.g. [Environment]::SetEnvironmentVariable('ADO_PAT','<token>','User') then restart VS Code)."
+    exit 1
+}
 
 # --- Auto-Correct File Extensions based on Format ---
 if ($Format -eq 'excel' -and $Output -match '\.(json|csv)$') { $Output = $Output -replace '\.(json|csv)$', '.xlsx' }
