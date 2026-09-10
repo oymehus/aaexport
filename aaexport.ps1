@@ -54,12 +54,38 @@ function Add-AreaNodePaths {
         [hashtable]$AreaPathMap
     )
 
-    if ($null -ne $Node.id -and -not [string]::IsNullOrWhiteSpace([string]$Node.path)) {
-        $AreaPathMap[[string]$Node.id] = ([string]$Node.path).TrimStart('\')
-    }
+    # Paths are composed from node names rather than taken from node.path,
+    # because the classification API returns paths that include the "Area" root
+    # segment (\Project\Area\Team) which work item System.AreaPath values omit
+    # (Project\Team). Composing from names also avoids localisation of that
+    # root segment.
+    # The walk is iterative to avoid recursion limits on deep trees and the
+    # PowerShell pitfall where @($node.children) on a leaf yields one $null item.
+    if ($null -eq $Node) { return }
 
-    foreach ($child in @($Node.children)) {
-        Add-AreaNodePaths -Node $child -AreaPathMap $AreaPathMap
+    $stack = [System.Collections.Stack]::new()
+    $stack.Push([pscustomobject]@{ Node = $Node; Path = $null })
+
+    while ($stack.Count -gt 0) {
+        $entry = $stack.Pop()
+        $current = $entry.Node
+        if ($null -eq $current) { continue }
+
+        $name = [string]$current.name
+        $path = if ([string]::IsNullOrEmpty($entry.Path)) { $name } else { "$($entry.Path)\$name" }
+
+        if ($null -ne $current.id -and -not [string]::IsNullOrWhiteSpace($path)) {
+            $AreaPathMap[[string]$current.id] = $path
+        }
+
+        $children = $current.children
+        if ($null -ne $children) {
+            foreach ($child in $children) {
+                if ($null -ne $child) {
+                    $stack.Push([pscustomobject]@{ Node = $child; Path = $path })
+                }
+            }
+        }
     }
 }
 
@@ -73,16 +99,16 @@ function Get-AreaPathMap {
     # Resolved directly (not via Invoke-AdoRest) so that a failure here degrades
     # gracefully instead of terminating the whole export: Invoke-AdoRest calls
     # exit after retries, which would abort the run before any file is written.
+    $areaPathMap = @{}
     try {
         $areaTree = Invoke-RestMethod -Uri "$BaseUrl/_apis/wit/classificationnodes/areas?`$depth=14&api-version=$ApiVersion" -Method Get -Headers $Headers -ContentType "application/json" -ErrorAction Stop
+        Add-AreaNodePaths -Node $areaTree -AreaPathMap $areaPathMap
     }
     catch {
         Write-Warning "Could not load the Area Path classification tree ($($_.Exception.Message)). Area Path values will use each work item's System.AreaPath as-is."
         return @{}
     }
 
-    $areaPathMap = @{}
-    Add-AreaNodePaths -Node $areaTree -AreaPathMap $areaPathMap
     return $areaPathMap
 }
 
@@ -93,14 +119,21 @@ function Resolve-AreaPath {
         $WorkItemId
     )
 
+    # System.AreaId is only returned when explicitly requested via the fields=
+    # query option, which cannot be combined with $expand. When it is absent the
+    # work item was read live, so System.AreaPath is already canonical and is
+    # used as-is. The id lookup matters for rows reused from the incremental
+    # cache, where a moved classification node leaves the stored path stale.
     $areaId = [string]$Fields."System.AreaId"
-    if ($areaId -and $AreaPathMap.ContainsKey($areaId)) {
-        return $AreaPathMap[$areaId]
+    if ($areaId) {
+        if ($AreaPathMap.ContainsKey($areaId)) {
+            return $AreaPathMap[$areaId]
+        }
+        if ($AreaPathMap.Count -gt 0) {
+            Write-Warning "Could not resolve Area ID '$areaId' for work item $WorkItemId from the current classification tree. Using System.AreaPath."
+        }
     }
 
-    if ($AreaPathMap.Count -gt 0) {
-        Write-Warning "Could not resolve Area ID '$areaId' for work item $WorkItemId from the current classification tree. Using System.AreaPath."
-    }
     return $Fields."System.AreaPath"
 }
 
