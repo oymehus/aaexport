@@ -1,16 +1,17 @@
 param(
-    [Parameter(Mandatory = $true)][string]$Org,
-    [Parameter(Mandatory = $true)][string]$Project,
-    [Parameter(Mandatory = $true)][string]$Team,
-    [Parameter(Mandatory = $true)][string]$Board,
-    [Parameter(Mandatory = $true)][string]$Pat,
-    [Parameter(Mandatory = $true)][string]$Output,
+    [Parameter(Mandatory=$true)][string]$Org,
+    [Parameter(Mandatory=$true)][string]$Project,
+    [Parameter(Mandatory=$true)][string]$Team,
+    [Parameter(Mandatory=$true)][string]$Board,
+    [Parameter(Mandatory=$true)][string]$Pat,
+    [Parameter(Mandatory=$true)][string]$Output,
     [ValidateSet('json', 'csv', 'excel')][string]$Format = 'json',
     [string[]]$WorkItemTypes, 
     [string[]]$AreaPaths,
     [string[]]$AdditionalFields,
     [switch]$FixDecreasingDates,
     [switch]$IncrementalUpdate,
+    [switch]$ChildCount,
     [int]$HistoryLimit = 1000,
     [int]$ThrottleLimit = 8
 )
@@ -23,11 +24,11 @@ elseif ($Format -eq 'json' -and $Output -match '\.(csv|xlsx)$') { $Output = $Out
 # --- 0. Constants & Helpers ---
 $apiVersion = "7.0"
 $encodedProject = [Uri]::EscapeDataString($Project)
-$encodedTeam = [Uri]::EscapeDataString($Team)
+$encodedTeam    = [Uri]::EscapeDataString($Team)
 
 $baseUrl = "https://dev.azure.com/$Org/$encodedProject"
 $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$($Pat)"))
-$headers = @{Authorization = ("Basic {0}" -f $base64AuthInfo) }
+$headers = @{Authorization=("Basic {0}" -f $base64AuthInfo)}
 
 function Invoke-AdoRest {
     param([string]$Url, $Headers)
@@ -37,8 +38,7 @@ function Invoke-AdoRest {
     while (-not $completed) {
         try {
             return Invoke-RestMethod -Uri $Url -Method Get -Headers $Headers -ContentType "application/json" -ErrorAction Stop
-        }
-        catch {
+        } catch {
             $statusCode = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
             if ($retryCount -ge $maxRetries) { Write-Error "API Call Failed ($statusCode): $($_.Exception.Message) | URL: $Url"; exit 1 }
             $wait = [Math]::Pow(2, $retryCount)
@@ -121,11 +121,13 @@ function Get-FlowMetricsRow {
         $FixDecreasingDates,
         $ColFieldRef,
         $DoneFieldRef,
+        $IncludeChildCount,
         $Headers
     )
 
     # 1. Fetch Current State
-    $wiDetail = Invoke-AdoRest -Url "$BaseUrl/_apis/wit/workitems/$($Id)?`$expand=None&api-version=$ApiVersion" -Headers $Headers
+    $expandParam = if ($IncludeChildCount) { "Relations" } else { "None" }
+    $wiDetail = Invoke-AdoRest -Url "$BaseUrl/_apis/wit/workitems/$($Id)?`$expand=$expandParam&api-version=$ApiVersion" -Headers $Headers
     
     $rawTags = $wiDetail.fields."System.Tags"
     $formattedTags = ""
@@ -138,19 +140,18 @@ function Get-FlowMetricsRow {
     if ($wiDetail.fields."System.ChangedDate") {
         try { 
             $changedDateStr = ([DateTime]$wiDetail.fields."System.ChangedDate").ToString("yyyy-MM-dd") 
-        }
-        catch { 
+        } catch { 
             $changedDateStr = $wiDetail.fields."System.ChangedDate" 
         }
     }
 
     $rowMap = [ordered]@{
-        "ID"             = $wiDetail.id
-        "Link"           = $wiDetail._links.html.href
-        "Title"          = $wiDetail.fields."System.Title"
+        "ID" = $wiDetail.id
+        "Link" = $wiDetail._links.html.href
+        "Title" = $wiDetail.fields."System.Title"
         "Work Item Type" = $wiDetail.fields."System.WorkItemType"
-        "Tags"           = $formattedTags
-        "Changed Date"   = $changedDateStr 
+        "Tags" = $formattedTags
+        "Changed Date" = $changedDateStr 
     }
 
     # 2. Dynamic Field Injection
@@ -181,6 +182,14 @@ function Get-FlowMetricsRow {
     $rowMap["Area Path"] = $fullAreaPath
     $rowMap["Blocked"] = $wiDetail.fields."Microsoft.VSTS.CMMI.Blocked"
     $rowMap["Blocked Days"] = 0
+
+    if ($IncludeChildCount) {
+        $cCount = 0
+        if ($wiDetail.relations) {
+            $cCount = @($wiDetail.relations | Where-Object { $_.rel -eq 'System.LinkTypes.Hierarchy-Forward' }).Count
+        }
+        $rowMap["ChildCount"] = $cCount
+    }
 
     foreach ($col in $BoardColumns) { $rowMap[$col] = $null }
 
@@ -268,8 +277,7 @@ function Get-FlowMetricsRow {
             if ($anchorDateVal) {
                 try {
                     $rowMap[$liveTarget] = ([DateTime]$anchorDateVal).ToString("yyyy-MM-dd")
-                }
-                catch {
+                } catch {
                     $rowMap[$liveTarget] = $anchorDateVal
                 }
                 if ($liveTargetIndex -gt $maxColIndexReached) { $maxColIndexReached = $liveTargetIndex }
@@ -305,8 +313,7 @@ function Get-FlowMetricsRow {
                 # Enforce monotonicity: An upstream date cannot be newer than a downstream date
                 if ($runningMinDate -lt [DateTime]::MaxValue -and $thisDate -gt $runningMinDate) {
                     $rowMap[$colName] = $runningMinDate.ToString("yyyy-MM-dd")
-                }
-                else {
+                } else {
                     # Establish new anchor
                     $runningMinDate = $thisDate
                 }
@@ -364,6 +371,7 @@ foreach ($fieldDef in $AdditionalFields) {
 
 # --- REORDERED: ID, Link, Title -> Workflow Steps -> Metadata
 $finalHeaders = @("ID", "Link", "Title") + $boardColumns + @("Work Item Type", "Tags", "Changed Date") + $extraHeaders + @("State", "Area Path", "Blocked", "Blocked Days")
+if ($ChildCount) { $finalHeaders += "ChildCount" }
 
 # --- 3. Incremental Cache Load ---
 $cache = $null
@@ -426,8 +434,7 @@ if ($cache) {
                     try {
                         $dtServer = [DateTime]$serverDateStr; $dtCache = [DateTime]$cachedDateStr
                         if ($dtServer.ToString("yyyy-MM-dd") -eq $dtCache.ToString("yyyy-MM-dd")) { $isMatch = $true }
-                    }
-                    catch {
+                    } catch {
                         if ($serverDateStr -eq $cachedDateStr) { $isMatch = $true }
                     }
                 }
@@ -435,22 +442,19 @@ if ($cache) {
                 if ($isMatch) {
                     $cachedRowsToKeep.Add($cache[$id].Data)
                     $skipCount++
-                }
-                else {
+                } else {
                     $itemsToProcess.Add($wi)
                     $changeCount++
                 }
-            }
-            else {
+            } else {
                 $itemsToProcess.Add($wi)
                 $newCount++
             }
         }
     }
     Write-Host "Delta: $newCount New, $changeCount Changed, $skipCount Skipped." -ForegroundColor Yellow
-}
-else {
-    foreach ($item in $rawWorkItems) { $itemsToProcess.Add($item) }
+} else {
+    foreach($item in $rawWorkItems) { $itemsToProcess.Add($item) }
 }
 
 # --- 6. Process Loop ---
@@ -479,11 +483,12 @@ if ($itemsToProcess.Count -gt 0) {
                 -FixDecreasingDates $using:FixDecreasingDates `
                 -ColFieldRef $using:colFieldRef `
                 -DoneFieldRef $using:doneFieldRef `
+                -IncludeChildCount $using:ChildCount `
                 -Headers $using:headers
             return [PSCustomObject]$row
         } -ThrottleLimit $ThrottleLimit
 
-        foreach ($r in $pResults) { $processedResults.Add($r) }
+        foreach($r in $pResults) { $processedResults.Add($r) }
     } 
     else {
         Write-Host "Processing $($itemsToProcess.Count) items Sequentially..." -ForegroundColor Yellow
@@ -501,6 +506,7 @@ if ($itemsToProcess.Count -gt 0) {
                 -FixDecreasingDates $FixDecreasingDates `
                 -ColFieldRef $colFieldRef `
                 -DoneFieldRef $doneFieldRef `
+                -IncludeChildCount $ChildCount `
                 -Headers $headers
 
             $processedResults.Add([PSCustomObject]$row)
@@ -513,8 +519,8 @@ if ($itemsToProcess.Count -gt 0) {
 Write-Host "Merging & Exporting to $Format format..." -ForegroundColor Cyan
 
 $allData = [System.Collections.Generic.List[PSCustomObject]]::new()
-foreach ($c in $cachedRowsToKeep) { $allData.Add($c) }
-foreach ($p in $processedResults) { $allData.Add($p) }
+foreach($c in $cachedRowsToKeep) { $allData.Add($c) }
+foreach($p in $processedResults) { $allData.Add($p) }
 
 if ($Format -eq 'json') {
     $jsonRows = [System.Collections.Generic.List[String]]::new()
@@ -540,8 +546,7 @@ if ($Format -eq 'json') {
     $finalJson = "[" + [Environment]::NewLine + ($jsonRows -join "," + [Environment]::NewLine) + [Environment]::NewLine + "]"
     $finalJson | Set-Content -Path $Output -Encoding UTF8
 
-}
-elseif ($Format -eq 'csv' -or $Format -eq 'excel') {
+} elseif ($Format -eq 'csv' -or $Format -eq 'excel') {
     $excelSuccess = $false
 
     if ($Format -eq 'excel') {
@@ -550,7 +555,7 @@ elseif ($Format -eq 'csv' -or $Format -eq 'excel') {
         if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
         if (Test-Path $absOutput) { Remove-Item $absOutput -Force }
 
-        $tempCsv = Join-Path $outDir ("~temp_" + [System.Guid]::NewGuid().ToString().Substring(0, 8) + ".csv")
+        $tempCsv = Join-Path $outDir ("~temp_" + [System.Guid]::NewGuid().ToString().Substring(0,8) + ".csv")
         $allData | Select-Object $finalHeaders | Export-Csv -Path $tempCsv -NoTypeInformation -Encoding UTF8 -UseCulture
 
         try {
@@ -565,16 +570,13 @@ elseif ($Format -eq 'csv' -or $Format -eq 'excel') {
             
             if (Test-Path $absOutput) {
                 $excelSuccess = $true
-            }
-            else {
+            } else {
                 Write-Warning "Excel reported success but the file was not found at: $absOutput"
             }
             
-        }
-        catch {
+        } catch {
             Write-Warning "Failed to generate native Excel file: $($_.Exception.Message)"
-        }
-        finally {
+        } finally {
             if ($null -ne $wb) { try { $wb.Close($false) } catch {} }
             if ($null -ne $excel) { 
                 try { $excel.Quit() } catch {}
