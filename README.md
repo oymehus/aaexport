@@ -46,7 +46,7 @@ The script is controlled entirely via command-line arguments.
 | `-Org` | String | Yes | Your Azure DevOps Organization name (e.g., `mycompany`). |
 | `-Project` | String | Yes | The Project name (e.g., `myproject`). |
 | `-Team` | String | Yes | The specific Team name that owns the board (e.g., `"myteam"`). |
-| `-Pat` | String | Yes | A Personal Access Token with **Read** access to Work Items. |
+| `-Pat` | String | No | A Personal Access Token with **Read** access to Work Items. If omitted, the `ADO_PAT` environment variable is used. |
 
 ### Board Configuration
 | Parameter | Type | Required | Description |
@@ -125,10 +125,22 @@ Note: Arguments containing spaces must be wrapped in escaped quotes `` \" ``.
                     "NodeName",
         
                 "-FixDecreasingDates",
-                "-Output", "${workspaceFolder}/export.json",
-                "-Pat", "${env:ADO_PAT}"
+                "-Output", "${workspaceFolder}/export.json"
+                // No "-Pat" entry: the script reads the ADO_PAT environment
+                // variable. Keeping the token out of launch.json avoids
+                // committing it by accident.
             ]
         }
     ]
 }
 ```
+
+### 3. Supplying the Personal Access Token
+Passing `-Pat` on the command line works, but the token then ends up in shell history and in `launch.json`. Prefer the `ADO_PAT` environment variable, which the script falls back to automatically:
+
+```powershell
+# Set once, per user. Restart VS Code afterwards so it inherits the variable.
+[Environment]::SetEnvironmentVariable('ADO_PAT', 'YOUR_PERSONAL_ACCESS_TOKEN', 'User')
+```
+
+Note that `${ADO_PAT}` is **not** valid inside `launch.json`. VS Code only expands environment variables written as `${env:ADO_PAT}`, and silently substitutes an empty string for anything it does not recognise. Omitting `-Pat` altogether is the safest option.
