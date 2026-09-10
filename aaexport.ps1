@@ -70,7 +70,17 @@ function Get-AreaPathMap {
         $Headers
     )
 
-    $areaTree = Invoke-AdoRest -Url "$BaseUrl/_apis/wit/classificationnodes/areas?`$depth=14&api-version=$ApiVersion" -Headers $Headers
+    # Resolved directly (not via Invoke-AdoRest) so that a failure here degrades
+    # gracefully instead of terminating the whole export: Invoke-AdoRest calls
+    # exit after retries, which would abort the run before any file is written.
+    try {
+        $areaTree = Invoke-RestMethod -Uri "$BaseUrl/_apis/wit/classificationnodes/areas?`$depth=14&api-version=$ApiVersion" -Method Get -Headers $Headers -ContentType "application/json" -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Could not load the Area Path classification tree ($($_.Exception.Message)). Area Path values will use each work item's System.AreaPath as-is."
+        return @{}
+    }
+
     $areaPathMap = @{}
     Add-AreaNodePaths -Node $areaTree -AreaPathMap $areaPathMap
     return $areaPathMap
@@ -88,7 +98,9 @@ function Resolve-AreaPath {
         return $AreaPathMap[$areaId]
     }
 
-    Write-Warning "Could not resolve Area ID '$areaId' for work item $WorkItemId from the current classification tree. Using System.AreaPath."
+    if ($AreaPathMap.Count -gt 0) {
+        Write-Warning "Could not resolve Area ID '$areaId' for work item $WorkItemId from the current classification tree. Using System.AreaPath."
+    }
     return $Fields."System.AreaPath"
 }
 
