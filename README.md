@@ -60,7 +60,7 @@ The script is controlled entirely via command-line arguments.
 | :--- | :--- | :--- | :--- |
 | `-Output` | Path | Yes | The destination path for the file (e.g., `./export.json`). |
 | `-Format` | String | No | Format of the exported file: `json` (default), `csv`, or `excel`. ActionableAgile imports require `json` or `csv`. |
-| `-IncrementalUpdate`| Switch | No | Enables smart delta updates. Reads the existing output file and only fetches history for items with a newer `Changed Date`. *(Supports `.json` and `.csv` files).* |
+| `-IncrementalUpdate`| Switch | No | Enables smart delta updates. Reads the existing output file and only fetches history for items with a newer `Changed Date`. Because `Changed Date` is stored per day, items changed within 24 hours before the previous export was written are always refreshed, so same-day changes are not missed. *(Supports `.json` and `.csv` files).* |
 | `-HistoryLimit` | Int | No | Max number of most recent items to fetch. Default is `1000`. |
 | `-FixDecreasingDates`| Switch | No | If set, clears timestamps that appear chronologically *earlier* than a previous column (fixes "backward movement" data errors). |
 | `-ThrottleLimit` | Int | No | (PS 7+ only) Number of concurrent threads. Default is `8`. |
