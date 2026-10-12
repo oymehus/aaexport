@@ -6,8 +6,8 @@ This tool bridges the gap for users with a standalone SaaS license for Actionabl
 
 ## Features
 * **Multi-Format Export:** Export your data natively to ActionableAgile JSON Matrix (`json`), standard Comma-Separated Values (`csv`), or native Microsoft Excel workbooks (`excel`).
-* **Strict Schema Compliance:** The exported data is strictly ordered (`ID, Link, Title -> Workflow Steps -> Metadata`) and dates are sanitized (`yyyy-MM-dd`) to guarantee flawless import into ActionableAgile.
-* **Incremental Updates:** Drastically reduces runtime by comparing the live `Changed Date` against your local file (supports both `.json` and `.csv` baselines), fetching history only for modified items.
+* **Strict Schema Compliance:** The exported data is strictly ordered (`ID, Link, Title -> Workflow Steps -> Metadata`) and workflow dates are sanitized (`yyyy-MM-dd`) to guarantee flawless import into ActionableAgile. `Changed Date` retains the full Azure DevOps timestamp converted to the exporting computer's local timezone, including its UTC offset.
+* **Incremental Updates:** Drastically reduces runtime by comparing the full-precision Azure DevOps `Changed Date` timestamp against your local file (supports both `.json` and `.csv` baselines), fetching history only for modified items.
 * **Robust ADO State Anchoring:** Automatically resolves cross-team board columns (WEF fields) and uses live state anchoring to catch items closed via PR merges or direct API calls that bypass standard drag-and-drop events.
 * **Split Column Support:** Automatically detects "Doing/Done" split columns and exports them as separate stages (e.g., `Develop` and `Develop Done`).
 * **Blocked Days Calculation:** Calculates the total days an item was flagged as "Blocked", excluding same-day blocks.
@@ -60,7 +60,7 @@ The script is controlled entirely via command-line arguments.
 | :--- | :--- | :--- | :--- |
 | `-Output` | Path | Yes | The destination path for the file (e.g., `./export.json`). |
 | `-Format` | String | No | Format of the exported file: `json` (default), `csv`, or `excel`. ActionableAgile imports require `json` or `csv`. |
-| `-IncrementalUpdate`| Switch | No | Enables smart delta updates. Reads the existing output file and only fetches history for items with a newer `Changed Date`. *(Supports `.json` and `.csv` files).* |
+| `-IncrementalUpdate`| Switch | No | Enables smart delta updates. Reads the existing output file and fetches history when `Changed Date` differs. The `Changed Date` column is stored as a full-precision local timestamp with its UTC offset; comparisons normalize timestamps to UTC so same-day changes are detected without relying on the local computer's clock. Existing UTC timestamps remain compatible. Existing files with date-only `Changed Date` values are refreshed once to populate the timestamps. *(Supports `.json` and `.csv` files).* |
 | `-HistoryLimit` | Int | No | Max number of most recent items to fetch. Default is `1000`. |
 | `-FixDecreasingDates`| Switch | No | If set, clears timestamps that appear chronologically *earlier* than a previous column (fixes "backward movement" data errors). |
 | `-ThrottleLimit` | Int | No | (PS 7+ only) Number of concurrent threads. Default is `8`. |
