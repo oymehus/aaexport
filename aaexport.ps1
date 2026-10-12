@@ -281,10 +281,13 @@ function Get-FlowMetricsRow {
 
     $changedDateStr = ""
     if ($wiDetail.fields."System.ChangedDate") {
-        try { 
-            $changedDateStr = ([DateTime]$wiDetail.fields."System.ChangedDate").ToString("yyyy-MM-dd") 
-        } catch { 
-            $changedDateStr = $wiDetail.fields."System.ChangedDate" 
+        try {
+            $changedDateStr = ([DateTimeOffset]::Parse(
+                [string]$wiDetail.fields."System.ChangedDate",
+                [Globalization.CultureInfo]::InvariantCulture
+            )).ToLocalTime().ToString("o", [Globalization.CultureInfo]::InvariantCulture)
+        } catch {
+            $changedDateStr = $wiDetail.fields."System.ChangedDate"
         }
     }
 
@@ -513,15 +516,6 @@ if ($IncrementalUpdate) {
     if ($cache) { Write-Host "Cache loaded: $($cache.Count) items found." -ForegroundColor Cyan }
 }
 
-# "Changed Date" is stored at day granularity, so an item changed again later on
-# the same day as the previous export would look unchanged. Use the previous
-# export's write time (minus a safety margin for run duration and clock skew)
-# as a full-precision watermark: anything changed after it is always refreshed.
-$cacheWatermarkUtc = $null
-if ($cache) {
-    $cacheWatermarkUtc = (Get-Item -LiteralPath $Output).LastWriteTimeUtc.AddDays(-1)
-}
-
 # --- 4. Fetch Work Items (Lightweight) ---
 Write-Host "Fetching work item list..."
 $typeWhere = ""
@@ -586,11 +580,11 @@ if ($cache) {
         if ($cache.ContainsKey($id)) {
             $cachedDateStr = $cache[$id].ChangedDate
             $isMatch = $false
-            if ($serverDateStr -and $cachedDateStr) {
+            if ($serverDateStr -and $cachedDateStr -and $cachedDateStr -match 'T') {
                 try {
-                    $dtServer = [DateTime]$serverDateStr; $dtCache = [DateTime]$cachedDateStr
-                    if ($dtServer.ToString("yyyy-MM-dd") -eq $dtCache.ToString("yyyy-MM-dd") -and
-                        $dtServer.ToUniversalTime() -lt $cacheWatermarkUtc) { $isMatch = $true }
+                    $dtServer = [DateTimeOffset]::Parse([string]$serverDateStr, [Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+                    $dtCache = [DateTimeOffset]::Parse([string]$cachedDateStr, [Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+                    if ($dtServer -eq $dtCache) { $isMatch = $true }
                 } catch {
                     if ($serverDateStr -eq $cachedDateStr) { $isMatch = $true }
                 }
